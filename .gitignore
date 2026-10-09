@@ -1,0 +1,7 @@
+*.pt
+weights/
+rec/
+runs/
+*.csv
+view.jpg
+__pycache__/
