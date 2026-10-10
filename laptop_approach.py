@@ -52,15 +52,14 @@ ap.add_argument("--hfov", type=float, default=65.0)
 # gimbal
 ap.add_argument("--pan-sign", type=float, default=1.0)
 ap.add_argument("--tilt-sign", type=float, default=1.0)
-ap.add_argument("--gain", type=float, default=2.0,
-                help="multiplier on the measured angular error per correction; >1 works on our robot, probably "
-                     "because --hfov 65 underestimates the real FOV -- retune to ~1 after calibration")
+ap.add_argument("--gain", type=float, default=0.8,
+                help="fraction of the measured angular error corrected per move (2.0 also worked uncalibrated)")
 ap.add_argument("--deadband", type=float, default=1.5, help="deg")
-ap.add_argument("--max-step", type=float, default=60.0, help="max gimbal angle change per update, deg")
+ap.add_argument("--max-step", type=float, default=100.0, help="max gimbal angle change per update, deg")
 ap.add_argument("--gimbal-spd", type=int, default=0, help="ESP32 gimbal speed (0 = fastest; lower = slower)")
 ap.add_argument("--gimbal-acc", type=int, default=0, help="ESP32 gimbal acceleration (0 = fastest)")
 ap.add_argument("--settle", type=float, default=0.15, help="s; extra wait after a move before trusting detections")
-ap.add_argument("--settle-dps", type=float, default=100.0,
+ap.add_argument("--settle-dps", type=float, default=200.0,
                 help="assumed gimbal speed at --gimbal-spd, deg/s (adds |move|/this); lower if it still overshoots")
 ap.add_argument("--settle-timeout", type=float, default=1.5, help="s; give up waiting for the move to show up")
 ap.add_argument("--no-settle", action="store_true", help="old behaviour: correct on every detection")
