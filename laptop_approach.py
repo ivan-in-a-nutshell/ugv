@@ -91,10 +91,22 @@ GLOBAL_SWEEP = [float(a) for a in args.sweep.split(",")]
 LOCAL_OFFSETS = [float(a) for a in args.local_offsets.split(",")]
 
 calib = None
+K = dist = None
 if os.path.exists(args.calib):
-    K = np.load(args.calib)["K"]
+    d = np.load(args.calib)
+    K, dist = d["K"], d["dist"]
     calib = (K[0, 0], K[1, 1], K[0, 2], K[1, 2])
-    print("Loaded calibration fx fy cx cy =", calib)
+    print("Loaded calibration fx fy cx cy =", calib, " dist =", dist.ravel())
+
+
+def pixel_to_angles(u, v, fx, fy, cx, cy):
+    """Angles (deg) of pixel (u, v) from the optical axis. With calibration, lens distortion is removed first:
+    the lens is ~100 deg wide with strong barrel distortion, so the plain pinhole formula is off near the edges."""
+    if K is not None:
+        x, y = cv2.undistortPoints(np.array([[[u, v]]], np.float64), K, dist)[0, 0]
+    else:
+        x, y = (u - cx) / fx, (v - cy) / fy
+    return math.degrees(math.atan(x)), math.degrees(math.atan(y))
 
 ctx = zmq.Context()
 sub = ctx.socket(zmq.SUB)
@@ -253,8 +265,7 @@ while not stop_requested:
         box_ratio = (y2 - y1) / h
         cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
 
-        err_pan = math.degrees(math.atan2(u - cx, fx))
-        err_tilt = math.degrees(math.atan2(v - cy, fy))
+        err_pan, err_tilt = pixel_to_angles(u, v, fx, fy, cx, cy)
 
         # bearing of the target relative to the body at capture time, then corrected for rotation since
         target_pan = hdr["pan_cmd"] + args.pan_sign * err_pan - yaw_ff

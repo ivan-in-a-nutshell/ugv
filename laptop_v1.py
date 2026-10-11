@@ -54,11 +54,22 @@ args = ap.parse_args()
 
 # ---------------- camera intrinsics ----------------
 calib = None
+K = dist = None
 if os.path.exists(args.calib):
     d = np.load(args.calib)
-    K = d["K"]
+    K, dist = d["K"], d["dist"]
     calib = (K[0, 0], K[1, 1], K[0, 2], K[1, 2])
-    print("Loaded calibration fx fy cx cy =", calib)
+    print("Loaded calibration fx fy cx cy =", calib, " dist =", dist.ravel())
+
+
+def pixel_to_angles(u, v, fx, fy, cx, cy):
+    """Angles (deg) of pixel (u, v) from the optical axis. With calibration, lens distortion is removed first:
+    the lens is ~100 deg wide with strong barrel distortion, so the plain pinhole formula is off near the edges."""
+    if K is not None:
+        x, y = cv2.undistortPoints(np.array([[[u, v]]], np.float64), K, dist)[0, 0]
+    else:
+        x, y = (u - cx) / fx, (v - cy) / fy
+    return math.degrees(math.atan(x)), math.degrees(math.atan(y))
 
 # ---------------- network ----------------
 ctx = zmq.Context()
@@ -150,8 +161,7 @@ while True:
         conf = float(res.boxes.conf[i])
         u, v = (x1 + x2) / 2, (y1 + y2) / 2
         # pixel error -> angle (pinhole model)
-        err_pan = math.degrees(math.atan2(u - cx, fx))
-        err_tilt = math.degrees(math.atan2(v - cy, fy))
+        err_pan, err_tilt = pixel_to_angles(u, v, fx, fy, cx, cy)
         cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
         cv2.putText(frame, f"{conf:.2f}", (int(x1), int(y1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
