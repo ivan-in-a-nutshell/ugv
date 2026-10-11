@@ -7,7 +7,10 @@ Needs the updated robot_bridge.py on the Pi (drive commands + stop watchdog).
   python laptop_approach.py --robot 192.168.50.5 --prompt "a red backpack" --no-drive
   python laptop_approach.py --robot 192.168.50.5 --prompt "a red backpack"
 
-Keys: SPACE = pause/resume driving (emergency stop), q = stop and quit, c = re-center gimbal.
+Keys (click the video window first so it has keyboard focus):
+  SPACE = pause/resume driving (emergency stop), q / ESC = stop and quit,
+  c = stop tracks, re-center gimbal and HOLD (no tracking/search) until SPACE.
+  Ctrl+C in the terminal also stops the tracks and quits.
 
 v2 changes (fixes for "gimbal too fast" and "loses target while the chassis turns"):
   - gimbal speed/acceleration limits (SPD/ACC sent to the ESP32) + max angle change per update
@@ -16,6 +19,12 @@ v2 changes (fixes for "gimbal too fast" and "loses target while the chassis turn
   - gentler chassis turning: turn deadband, turn-rate limit, turn slows down near alignment
   - local re-acquisition: when the target is lost, look first around where it was last seen
     (corrected for chassis rotation) before falling back to the full sweep
+
+v3: settle gating (same fix as laptop_v1.py). A gimbal correction is made only from a frame captured after
+the previous move was applied and the gimbal had time to settle; otherwise the same error is corrected
+several times while the move is still in flight -> overshoot/oscillation. Every command we send gets an
+index; the frame header echoes the angles the bridge had applied at capture, so matching it against the
+recent send history tells us which command the frame already shows. Yaw feed-forward still runs every frame.
 """
 import os
 os.environ.setdefault("YOLO_OFFLINE", "true")
@@ -24,7 +33,9 @@ import argparse
 import csv
 import json
 import math
+import signal
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -41,11 +52,17 @@ ap.add_argument("--hfov", type=float, default=65.0)
 # gimbal
 ap.add_argument("--pan-sign", type=float, default=1.0)
 ap.add_argument("--tilt-sign", type=float, default=1.0)
-ap.add_argument("--gain", type=float, default=0.5, help="fraction of angular error corrected per detection")
+ap.add_argument("--gain", type=float, default=0.8,
+                help="fraction of the measured angular error corrected per move (2.0 also worked uncalibrated)")
 ap.add_argument("--deadband", type=float, default=1.5, help="deg")
-ap.add_argument("--max-step", type=float, default=8.0, help="max gimbal angle change per update, deg")
-ap.add_argument("--gimbal-spd", type=int, default=50, help="ESP32 gimbal speed (0 = fastest; lower = slower)")
-ap.add_argument("--gimbal-acc", type=int, default=10, help="ESP32 gimbal acceleration (0 = fastest)")
+ap.add_argument("--max-step", type=float, default=100.0, help="max gimbal angle change per update, deg")
+ap.add_argument("--gimbal-spd", type=int, default=0, help="ESP32 gimbal speed (0 = fastest; lower = slower)")
+ap.add_argument("--gimbal-acc", type=int, default=0, help="ESP32 gimbal acceleration (0 = fastest)")
+ap.add_argument("--settle", type=float, default=0.15, help="s; extra wait after a move before trusting detections")
+ap.add_argument("--settle-dps", type=float, default=200.0,
+                help="assumed gimbal speed at --gimbal-spd, deg/s (adds |move|/this); lower if it still overshoots")
+ap.add_argument("--settle-timeout", type=float, default=1.5, help="s; give up waiting for the move to show up")
+ap.add_argument("--no-settle", action="store_true", help="old behaviour: correct on every detection")
 # chassis
 ap.add_argument("--drive-sign", type=float, default=1.0)
 ap.add_argument("--turn-sign", type=float, default=1.0)
@@ -74,10 +91,22 @@ GLOBAL_SWEEP = [float(a) for a in args.sweep.split(",")]
 LOCAL_OFFSETS = [float(a) for a in args.local_offsets.split(",")]
 
 calib = None
+K = dist = None
 if os.path.exists(args.calib):
-    K = np.load(args.calib)["K"]
+    d = np.load(args.calib)
+    K, dist = d["K"], d["dist"]
     calib = (K[0, 0], K[1, 1], K[0, 2], K[1, 2])
-    print("Loaded calibration fx fy cx cy =", calib)
+    print("Loaded calibration fx fy cx cy =", calib, " dist =", dist.ravel())
+
+
+def pixel_to_angles(u, v, fx, fy, cx, cy):
+    """Angles (deg) of pixel (u, v) from the optical axis. With calibration, lens distortion is removed first:
+    the lens is ~100 deg wide with strong barrel distortion, so the plain pinhole formula is off near the edges."""
+    if K is not None:
+        x, y = cv2.undistortPoints(np.array([[[u, v]]], np.float64), K, dist)[0, 0]
+    else:
+        x, y = (u - cx) / fx, (v - cy) / fy
+    return math.degrees(math.atan(x)), math.degrees(math.atan(y))
 
 ctx = zmq.Context()
 sub = ctx.socket(zmq.SUB)
@@ -98,20 +127,50 @@ def clamp(x, lo, hi):
 
 
 paused = False
+hold = False                          # after 'c': gimbal centered, no tracking/search until SPACE
 gimbal_pan, gimbal_tilt = 0.0, 0.0   # what we last commanded (our own copy, includes feed-forward)
 turn_now = 0.0                        # last turn command sent, "toward positive pan" units
+cmd_idx = 0                           # index of the last gimbal command sent
+sent_hist = deque(maxlen=100)         # (idx, pan, tilt) of recent gimbal commands
+pending = None                        # move we wait for before trusting detections (None = settled)
 
 
-def send_gimbal(hdr, pan, tilt, limit_step=True):
-    global gimbal_pan, gimbal_tilt
+def send_gimbal(hdr, pan, tilt, limit_step=True, correction=True):
+    """correction=False: feed-forward only, never starts a new settle wait."""
+    global gimbal_pan, gimbal_tilt, cmd_idx, pending
     if limit_step:
         pan = gimbal_pan + clamp(pan - gimbal_pan, -args.max_step, args.max_step)
         tilt = gimbal_tilt + clamp(tilt - gimbal_tilt, -args.max_step, args.max_step)
-    gimbal_pan = clamp(pan, -180.0, 180.0)
-    gimbal_tilt = clamp(tilt, -30.0, 90.0)
+    pan, tilt = clamp(pan, -180.0, 180.0), clamp(tilt, -30.0, 90.0)
+    changed = abs(pan - gimbal_pan) > 0.01 or abs(tilt - gimbal_tilt) > 0.01
+    gimbal_pan, gimbal_tilt = pan, tilt
     push.send_json({"frame_id": hdr["frame_id"], "t_capture": hdr["t_capture"],
                     "pan": gimbal_pan, "tilt": gimbal_tilt,
                     "spd": args.gimbal_spd, "acc": args.gimbal_acc})
+    cmd_idx += 1
+    sent_hist.append((cmd_idx, gimbal_pan, gimbal_tilt))
+    if correction and changed and not args.no_settle:
+        move = max(abs(gimbal_pan - hdr["pan_cmd"]), abs(gimbal_tilt - hdr["tilt_cmd"]))
+        pending = {"idx": cmd_idx, "settle": args.settle + move / args.settle_dps,
+                   "t_sent": time.monotonic(), "t_applied": None}
+
+
+def update_settle(hdr):
+    """True while the frame may not yet show the result of the last correction move."""
+    global pending
+    if pending is None:
+        return False
+    if pending["t_applied"] is None:
+        # newest command whose angles the bridge had applied when this frame was captured
+        shown = next((i for i, p, t in reversed(sent_hist)
+                      if abs(p - hdr["pan_cmd"]) < 1e-6 and abs(t - hdr["tilt_cmd"]) < 1e-6), None)
+        if shown is not None and shown >= pending["idx"]:
+            pending["t_applied"] = hdr["t_capture"]
+    if pending["t_applied"] is not None and hdr["t_capture"] - pending["t_applied"] >= pending["settle"]:
+        pending = None
+    elif time.monotonic() - pending["t_sent"] > args.settle_timeout:
+        pending = None                   # command lost -- don't stay stuck
+    return pending is not None
 
 
 def send_drive(v, turn):
@@ -136,7 +195,7 @@ def chassis_yaw_rate_deg():
 log_f = open(args.log, "w", newline="")
 log = csv.writer(log_f)
 log.writerow(["frame_id", "t_capture", "state", "det_ms", "found", "box_ratio",
-              "pan_cmd", "tilt_cmd", "yaw_ff_deg", "L", "R"])
+              "pan_cmd", "tilt_cmd", "yaw_ff_deg", "L", "R", "moving"])
 
 state = "SEARCH"
 last_seen = 0.0
@@ -149,10 +208,24 @@ spin_until = 0.0
 first_frame = True
 t_prev = time.time()
 
-while True:
+stop_requested = False
+
+
+def on_sigint(*_):
+    # first Ctrl+C: leave the loop and send the stop commands below; second Ctrl+C: hard exit
+    global stop_requested
+    stop_requested = True
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    print("Ctrl+C -> stopping tracks and quitting", flush=True)
+
+
+signal.signal(signal.SIGINT, on_sigint)
+
+while not stop_requested:
     msg = sub.recv()
     hdr_bytes, jpg = msg.split(b"\n", 1)
     hdr = json.loads(hdr_bytes)
+    moving = update_settle(hdr)
     frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
     h, w_img = frame.shape[:2]
     if first_frame:
@@ -180,7 +253,11 @@ while True:
     box_ratio = None
     L = R = 0.0
 
-    if found:
+    if hold:
+        state = "HOLD"
+        L, R = send_drive(0.0, 0.0)
+
+    elif found:
         last_seen = now
         i = int(res.boxes.conf.argmax())
         x1, y1, x2, y2 = res.boxes.xyxy[i].tolist()
@@ -188,8 +265,7 @@ while True:
         box_ratio = (y2 - y1) / h
         cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
 
-        err_pan = math.degrees(math.atan2(u - cx, fx))
-        err_tilt = math.degrees(math.atan2(v - cy, fy))
+        err_pan, err_tilt = pixel_to_angles(u, v, fx, fy, cx, cy)
 
         # bearing of the target relative to the body at capture time, then corrected for rotation since
         target_pan = hdr["pan_cmd"] + args.pan_sign * err_pan - yaw_ff
@@ -198,11 +274,16 @@ while True:
 
         pan_new = gimbal_pan - yaw_ff
         tilt_new = gimbal_tilt
-        if abs(err_pan) > args.deadband:
-            pan_new = pan_new + args.gain * (target_pan - pan_new)
-        if abs(err_tilt) > args.deadband:
-            tilt_new = tilt_new + args.gain * (target_tilt - tilt_new)
-        send_gimbal(hdr, pan_new, tilt_new)
+        if moving:
+            # last correction not visible yet: only keep counter-rotating against the chassis turn
+            if yaw_ff != 0.0:
+                send_gimbal(hdr, pan_new, tilt_new, limit_step=False, correction=False)
+        else:
+            if abs(err_pan) > args.deadband:
+                pan_new = pan_new + args.gain * (target_pan - pan_new)
+            if abs(err_tilt) > args.deadband:
+                tilt_new = tilt_new + args.gain * (target_tilt - tilt_new)
+            send_gimbal(hdr, pan_new, tilt_new)
 
         if box_ratio >= args.arrive_ratio:
             state = "ARRIVED"
@@ -255,11 +336,12 @@ while True:
             L, R = send_drive(0.0, 0.0)
 
     log.writerow([hdr["frame_id"], f"{hdr['t_capture']:.6f}", state, f"{det_ms:.1f}", int(found),
-                  box_ratio, f"{gimbal_pan:.2f}", f"{gimbal_tilt:.2f}", f"{yaw_ff:.2f}", f"{L:.3f}", f"{R:.3f}"])
+                  box_ratio, f"{gimbal_pan:.2f}", f"{gimbal_tilt:.2f}", f"{yaw_ff:.2f}", f"{L:.3f}", f"{R:.3f}", int(moving)])
 
     cv2.drawMarker(frame, (int(cx), int(cy)), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
-    color = {"SEARCH": (0, 200, 255), "TRACK": (0, 255, 0), "LOST": (0, 0, 255), "ARRIVED": (255, 0, 255)}[state]
-    txt = f"{state}{' PAUSED' if paused else ''}  det {det_ms:.0f}ms  pan {gimbal_pan:.0f}  L {L:.2f} R {R:.2f}"
+    color = {"SEARCH": (0, 200, 255), "TRACK": (0, 255, 0), "LOST": (0, 0, 255), "ARRIVED": (255, 0, 255),
+             "HOLD": (200, 200, 200)}[state]
+    txt = f"{state}{' PAUSED' if paused else ''}{' moving' if moving else ''}  det {det_ms:.0f}ms  pan {gimbal_pan:.0f}  L {L:.2f} R {R:.2f}"
     if box_ratio is not None:
         txt += f"  box {box_ratio:.2f}/{args.arrive_ratio:.2f}"
     cv2.putText(frame, txt, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
@@ -267,12 +349,19 @@ while True:
 
     k = cv2.waitKey(1) & 0xFF
     if k == ord(" "):
-        paused = not paused
+        if hold:
+            hold = paused = False         # leave HOLD: resume tracking and driving
+        else:
+            paused = not paused
         send_drive(0.0, 0.0)
-        print("PAUSED" if paused else "RESUMED")
-    if k == ord("c"):
+        print("PAUSED" if paused else "RESUMED", flush=True)
+    if k in (ord("c"), ord("C")):
+        # hold, otherwise the next detection / search step immediately moves the gimbal away again
+        hold = paused = True
+        send_drive(0.0, 0.0)
         send_gimbal(hdr, 0.0, 0.0, limit_step=False)
-    if k == ord("q"):
+        print("re-centered, HOLD (SPACE to resume)", flush=True)
+    if k in (ord("q"), ord("Q"), 27):     # 27 = ESC
         break
 
 for _ in range(5):
