@@ -69,7 +69,14 @@ The frames with a verified box (every 2nd), shrunk by 1x, 2x, 3x, 4x and padded 
 2-4x farther away). Correct lock by the target's box height after shrinking; any object class works this way.
 With our lens (fx ~ 273 px) a 0.4 m object is ~22 px tall at 5 m and ~11 px at 10 m.
 
-SIZE_TABLE
+| config | ms/frame | box 80+ px | box 40-80 px | box 20-40 px | box < 20 px |
+|---|---|---|---|---|---|
+| full (= V1) | 120 | 69% (n=39) | 67% (n=118) | 25% (n=212) | 3% (n=115) |
+| + tiles (SEARCH) | 747 | 69% | 78% | 44% | 22% |
+| + ROI zoom (TRACK) | 280 | 77% | 74% | 59% | 43% |
+| 1280 input | 438 | 64% | 44% | 36% | 23% |
+
+(first run, still includes the 5 sampled frames of `S1_seq01`; timings with other jobs running)
 
 - Below ~40 px the plain full-frame detector (V1) mostly fails -- this is the "can't find it beyond ~5 m" problem.
 - Zoomed tiles (used in SEARCH, ~7x the time) and a zoomed crop around the last box (used in TRACK for small
