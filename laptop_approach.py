@@ -25,6 +25,17 @@ the previous move was applied and the gimbal had time to settle; otherwise the s
 several times while the move is still in flight -> overshoot/oscillation. Every command we send gets an
 index; the frame header echoes the angles the bridge had applied at capture, so matching it against the
 recent send history tells us which command the frame already shows. Yaw feed-forward still runs every frame.
+
+v4 (midterm fixes):
+  - camera jumps: the bridge echoes a new pan_cmd as soon as it forwards the command, but the servo needs
+    ~0.3-0.4 s to get there. Frames in between were labelled with the new angle while still showing the old view,
+    so "pan_cmd + error" counted the error twice. The gimbal correction was already gated, but last_pan_seen and
+    the chassis bearing were still updated from those frames, and one missed detection sent the gimbal to that
+    wrong bearing at full speed (logged: -96 -> -151 deg). Now the bearing is only taken from settled frames,
+    a short miss (--miss-grace) keeps everything as it is, LOST holds the gimbal, and --max-step is 35 deg.
+  - with several boxes, keep the one closest to the previous box instead of the most confident one.
+  - detection via detector.py: zoomed 2x2 tiles while searching and a zoomed crop around a small target while
+    tracking (far objects); optional CLIP attribute check (--attr-check, experimental).
 """
 import os
 os.environ.setdefault("YOLO_OFFLINE", "true")
@@ -40,13 +51,24 @@ from collections import deque
 import cv2
 import numpy as np
 import zmq
-from ultralytics import YOLOWorld
+
+from detector import TextDetector
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--robot", required=True)
 ap.add_argument("--prompt", required=True)
 ap.add_argument("--model", default="yolov8s-worldv2.pt")
 ap.add_argument("--conf", type=float, default=0.10)
+ap.add_argument("--attr-check", action="store_true",
+                help="experimental: detect the bare noun, keep boxes CLIP finds closer to the full prompt than to the "
+                     "noun (helps 'a yellow chair' vs a red one, removes the target for 'a dark box'; see detector.py)")
+ap.add_argument("--attr-conf", type=float, default=0.05, help="noun-stage threshold with --attr-check")
+ap.add_argument("--noun", default=None, help="noun for --attr-check, default = last word of the prompt")
+ap.add_argument("--no-tiles", action="store_true", help="don't run zoomed tiles while searching")
+ap.add_argument("--roi-px", type=float, default=60.0,
+                help="while tracking, also run a 2x zoomed crop around the target if its box is lower than this, px")
+ap.add_argument("--assoc-px", type=float, default=200.0,
+                help="pick the box nearest the previous one if it is within this distance, px")
 ap.add_argument("--calib", default="calib.npz")
 ap.add_argument("--hfov", type=float, default=65.0)
 # gimbal
@@ -55,7 +77,7 @@ ap.add_argument("--tilt-sign", type=float, default=1.0)
 ap.add_argument("--gain", type=float, default=0.8,
                 help="fraction of the measured angular error corrected per move (2.0 also worked uncalibrated)")
 ap.add_argument("--deadband", type=float, default=1.5, help="deg")
-ap.add_argument("--max-step", type=float, default=100.0, help="max gimbal angle change per update, deg")
+ap.add_argument("--max-step", type=float, default=35.0, help="max gimbal angle change per update, deg")
 ap.add_argument("--gimbal-spd", type=int, default=0, help="ESP32 gimbal speed (0 = fastest; lower = slower)")
 ap.add_argument("--gimbal-acc", type=int, default=0, help="ESP32 gimbal acceleration (0 = fastest)")
 ap.add_argument("--settle", type=float, default=0.15, help="s; extra wait after a move before trusting detections")
@@ -77,6 +99,8 @@ ap.add_argument("--track-width", type=float, default=0.20, help="m, distance bet
 ap.add_argument("--yaw-comp", type=float, default=1.0,
                 help="gain of gimbal counter-rotation (0 = off; increase if target still drifts out while turning)")
 # search
+ap.add_argument("--miss-grace", type=float, default=0.35,
+                help="s; a detection gap shorter than this is ignored (no LOST, gimbal and tracks keep going)")
 ap.add_argument("--lost-timeout", type=float, default=1.0)
 ap.add_argument("--local-offsets", default="0,-25,25,-50,50", help="deg around last seen pan for local search")
 ap.add_argument("--sweep", default="-90,-45,0,45,90")
@@ -85,6 +109,8 @@ ap.add_argument("--spin-time", type=float, default=1.5)
 ap.add_argument("--spin-speed", type=float, default=0.08)
 ap.add_argument("--no-drive", action="store_true")
 ap.add_argument("--log", default="approach_log.csv")
+ap.add_argument("--headless", action="store_true", help="no video window (SSH / tests); stop with Ctrl+C")
+ap.add_argument("--duration", type=float, default=0.0, help="s; quit after this long (0 = run until stopped)")
 args = ap.parse_args()
 
 GLOBAL_SWEEP = [float(a) for a in args.sweep.split(",")]
@@ -117,8 +143,10 @@ push = ctx.socket(zmq.PUSH)
 push.connect(f"tcp://{args.robot}:5556")
 
 print("[1/3] loading model...", flush=True)
-model = YOLOWorld(args.model)
-model.set_classes([args.prompt])
+detector = TextDetector(args.prompt, model=args.model, noun=args.noun, attr_check=args.attr_check,
+                        conf=args.attr_conf if args.attr_check else args.conf)
+if detector.attr_check:
+    print(f"detecting '{detector.noun}', CLIP checks the crops against '{args.prompt}'", flush=True)
 print("[2/3] model ready, waiting for frames from", args.robot, flush=True)
 
 
@@ -195,11 +223,14 @@ def chassis_yaw_rate_deg():
 log_f = open(args.log, "w", newline="")
 log = csv.writer(log_f)
 log.writerow(["frame_id", "t_capture", "state", "det_ms", "found", "box_ratio",
-              "pan_cmd", "tilt_cmd", "yaw_ff_deg", "L", "R", "moving"])
+              "pan_cmd", "tilt_cmd", "yaw_ff_deg", "L", "R", "moving", "det_mode", "n_dets"])
 
 state = "SEARCH"
 last_seen = 0.0
-last_pan_seen = 0.0          # gimbal pan (relative to body) where the target was last seen
+last_pan_seen = 0.0          # bearing of the target relative to the body, from settled frames only
+last_box = None              # previous target box (image coords), for association and the zoomed crop
+last_LR = (0.0, 0.0)         # last drive command, repeated during a short detection gap
+bearing_t = 0.0              # when last_pan_seen was last measured on a settled frame
 search_list = list(GLOBAL_SWEEP)
 search_is_local = False
 search_idx = 0
@@ -221,7 +252,10 @@ def on_sigint(*_):
 
 signal.signal(signal.SIGINT, on_sigint)
 
+t_start = time.time()
 while not stop_requested:
+    if args.duration and time.time() - t_start > args.duration:
+        break
     msg = sub.recv()
     hdr_bytes, jpg = msg.split(b"\n", 1)
     hdr = json.loads(hdr_bytes)
@@ -239,7 +273,14 @@ while not stop_requested:
         fx, fy, cx, cy = calib
 
     t0 = time.perf_counter()
-    res = model.predict(frame, conf=args.conf, verbose=False)[0]
+    recent = last_box is not None and time.time() - last_seen < args.lost_timeout
+    if state == "SEARCH" and not args.no_tiles:
+        mode = "tiles"
+    elif recent and last_box[3] - last_box[1] < args.roi_px:
+        mode = "roi"
+    else:
+        mode = "full"
+    dets = detector(frame, mode=mode, last_box=last_box if recent else None)
     det_ms = (time.perf_counter() - t0) * 1000.0
     now = time.time()
     dt = now - t_prev
@@ -249,7 +290,7 @@ while not stop_requested:
     yaw_ff = args.yaw_comp * chassis_yaw_rate_deg() * dt
     last_pan_seen -= yaw_ff      # the target's bearing relative to the body shrinks as we turn toward it
 
-    found = len(res.boxes) > 0
+    found = len(dets) > 0
     box_ratio = None
     L = R = 0.0
 
@@ -259,8 +300,16 @@ while not stop_requested:
 
     elif found:
         last_seen = now
-        i = int(res.boxes.conf.argmax())
-        x1, y1, x2, y2 = res.boxes.xyxy[i].tolist()
+        best = dets[0]                     # highest score
+        if recent:
+            # stay on the same object: nearest box to the previous one (two similar objects -> no switching)
+            pcx, pcy = (last_box[0] + last_box[2]) / 2, (last_box[1] + last_box[3]) / 2
+            box_dist = lambda d: math.hypot((d[0] + d[2]) / 2 - pcx, (d[1] + d[3]) / 2 - pcy)
+            near = min(dets, key=box_dist)
+            if box_dist(near) < args.assoc_px:
+                best = near
+        x1, y1, x2, y2 = best[:4]
+        last_box = best[:4]
         u, v = (x1 + x2) / 2, (y1 + y2) / 2
         box_ratio = (y2 - y1) / h
         cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
@@ -270,7 +319,10 @@ while not stop_requested:
         # bearing of the target relative to the body at capture time, then corrected for rotation since
         target_pan = hdr["pan_cmd"] + args.pan_sign * err_pan - yaw_ff
         target_tilt = hdr["tilt_cmd"] - args.tilt_sign * err_tilt
-        last_pan_seen = target_pan
+        if not moving:
+            # only a settled frame shows the view at hdr["pan_cmd"]; in-flight frames would count the error twice
+            last_pan_seen = target_pan
+            bearing_t = now
 
         pan_new = gimbal_pan - yaw_ff
         tilt_new = gimbal_tilt
@@ -290,24 +342,32 @@ while not stop_requested:
             L, R = send_drive(0.0, 0.0)
         else:
             state = "TRACK"
-            bearing = target_pan
-            if abs(bearing) < args.turn_deadband:
-                turn = 0.0
+            bearing = last_pan_seen
+            if now - bearing_t > args.lost_timeout:
+                # just locked from a frame taken while the gimbal moved: no trustworthy bearing yet, don't drive
+                L, R = send_drive(0.0, 0.0)
             else:
-                turn = args.k_turn * bearing
-            if abs(bearing) < args.align_deg:
-                closeness = box_ratio / args.arrive_ratio
-                fwd = args.max_speed * max(0.3, 1.0 - closeness)
-            else:
-                fwd = 0.0
-            L, R = send_drive(fwd, turn)
+                turn = 0.0 if abs(bearing) < args.turn_deadband else args.k_turn * bearing
+                if abs(bearing) < args.align_deg:
+                    closeness = box_ratio / args.arrive_ratio
+                    fwd = args.max_speed * max(0.3, 1.0 - closeness)
+                else:
+                    fwd = 0.0
+                L, R = send_drive(fwd, turn)
         search_is_local = False
 
+    elif now - last_seen < args.miss_grace and state in ("TRACK", "ARRIVED"):
+        # one or two missed detections (blur, small target): keep doing what we did, no gimbal jump
+        L, R = (0.0, 0.0) if (paused or args.no_drive) else last_LR
+        push.send_json({"type": "drive", "L": L, "R": R})
+        if yaw_ff != 0.0:
+            send_gimbal(hdr, gimbal_pan - yaw_ff, gimbal_tilt, limit_step=False, correction=False)
+
     elif now - last_seen < args.lost_timeout:
-        # just lost: stop the body, keep the camera pointed where the target was (counter-rotated)
+        # lost: stop the body and hold the camera where it is (it already points at the last settled bearing
+        # or is moving there); sending it to a bearing from an in-flight frame is what made it jump before
         state = "LOST"
         L, R = send_drive(0.0, 0.0)
-        send_gimbal(hdr, last_pan_seen, gimbal_tilt)
 
     else:
         state = "SEARCH"
@@ -335,8 +395,9 @@ while not stop_requested:
             send_gimbal(hdr, search_list[search_idx], 0.0, limit_step=False)
             L, R = send_drive(0.0, 0.0)
 
+    last_LR = (L, R)
     log.writerow([hdr["frame_id"], f"{hdr['t_capture']:.6f}", state, f"{det_ms:.1f}", int(found),
-                  box_ratio, f"{gimbal_pan:.2f}", f"{gimbal_tilt:.2f}", f"{yaw_ff:.2f}", f"{L:.3f}", f"{R:.3f}", int(moving)])
+                  box_ratio, f"{gimbal_pan:.2f}", f"{gimbal_tilt:.2f}", f"{yaw_ff:.2f}", f"{L:.3f}", f"{R:.3f}", int(moving), mode, len(dets)])
 
     cv2.drawMarker(frame, (int(cx), int(cy)), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
     color = {"SEARCH": (0, 200, 255), "TRACK": (0, 255, 0), "LOST": (0, 0, 255), "ARRIVED": (255, 0, 255),
@@ -345,6 +406,8 @@ while not stop_requested:
     if box_ratio is not None:
         txt += f"  box {box_ratio:.2f}/{args.arrive_ratio:.2f}"
     cv2.putText(frame, txt, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+    if args.headless:
+        continue
     cv2.imshow("search and approach", frame)
 
     k = cv2.waitKey(1) & 0xFF
@@ -368,4 +431,5 @@ for _ in range(5):
     push.send_json({"type": "drive", "L": 0, "R": 0})
     time.sleep(0.05)
 log_f.close()
-cv2.destroyAllWindows()
+if not args.headless:
+    cv2.destroyAllWindows()

@@ -7,3 +7,9 @@ view.jpg
 __pycache__/
 *.swp
 .swp
+rec
+rec-*/
+venv/
+eval/sheets/
+eval/chair_sheets/
+eval/*.log
