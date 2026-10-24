@@ -7,7 +7,7 @@ take and is excluded). Timings: laptop i7-12650H, CPU only.
 python eval/candidates.py --rec rec --step 30   # candidate boxes + contact sheets (eval/sheets/)
 # a person writes eval/gt_raw.txt from the sheets (format in make_gt.py)
 python eval/make_gt.py                          # -> eval/gt.json
-python eval/run_detectors.py                    # -> eval/dets/<config>.json
+python eval/run_detectors.py                    # -> eval/dets/<config>.json (OWL models: pip install transformers)
 python eval/metrics.py                          # -> tables below, eval/results.json
 python eval/size_study.py --every 2             # -> object-size table below, eval/size_results.json
 ```
@@ -48,6 +48,8 @@ centring is poor when the target moves (S2) or leaves (S4).
 | l640 | 551 (557) | 50% | 3% | 47% | 36% | 19% / 34% |
 | x640 | 806 (839) | 57% | 4% | 39% | 48% | 30% / 29% |
 | s640 + attribute check | 275* (513) | 5% | 13% | 82% | 44% | 3% / 8% |
+| OWL-ViT B/32 | 418 (1248) | 12% | 60% | 28% | 76% | 3% / 21% |
+| OWLv2 B/16 | 4179 (4588) | 41% | 57% | 2% | 96% | 19% / 84% |
 
 Correct lock = the most confident box has IoU >= 0.5 with the target; wrong lock = it is on something else while
 the target is visible; false alarm = any box while the target is not in the frame. Threshold 0.10 (as on the
@@ -57,6 +59,11 @@ What it says:
 - **YOLO-World s at 640 stays the main detector**: the fastest and the best correct-lock rate. Bigger models are
   2.5-8x slower on this CPU and, at the same threshold, miss more (they are more conservative); upscaling to
   1280 finds more boxes but locks on the wrong one more often.
+- **OWLv2 / OWL-ViT (the proposal's heavier alternatives) are worse here, not better**: OWLv2 takes 4.2 s per
+  frame on this CPU (40x YOLO-World s) and its top box is on another dark object 57% of the time (the same with
+  IoU >= 0.1, so it is not a box-shape mismatch with our YOLO-drawn GT). It finds the box almost always (2% missed)
+  and is the best in low light (S6: 84%), but it ranks look-alikes above the target. OWL-ViT: 12% correct.
+  Even for SEARCH only (robot standing still) 4 s per frame is too slow for a sweep, so YOLO-World s stays.
 - **The detector almost always "sees" something**: 76% of frames without the target still get a "dark box"
   (monitors, black devices). This is what swings the camera away in S4 and the main argument for V4.
 - **Attribute check fails for this prompt**: CLIP is asked whether the crop fits "a dark box" better than "a box".

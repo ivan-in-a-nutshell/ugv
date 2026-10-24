@@ -8,3 +8,4 @@ pillow==13.0.0
 pyzmq==27.2.0
 matplotlib==3.11.2
 git+https://github.com/ultralytics/CLIP.git   # "clip" package, also used by ultralytics for YOLO-World text
+transformers==5.20.2   # only for eval/owl.py (OWLv2 / OWL-ViT benchmark)

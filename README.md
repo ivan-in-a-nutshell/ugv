@@ -52,7 +52,8 @@ Quick ground truth: one frame every 2 s (308 frames), the target box chosen by h
 centring error 13.3 deg mean / 46 deg p95; only 33% of frames near the centre in S2 (fast motion).
 
 **Detector choice (open loop, laptop CPU):** YOLO-World v2 **s** at 640 -- 102 ms/frame, correct lock 78%.
-m / l / x: 265 / 551 / 806 ms and 74 / 50 / 57% at the same threshold; 1280 input: 425 ms, 59%. When the
+m / l / x: 265 / 551 / 806 ms and 74 / 50 / 57% at the same threshold; 1280 input: 425 ms, 59%;
+OWLv2 (the proposal's heavier alternative): 4.2 s, 41% (best in low light, but locks on look-alikes); OWL-ViT: 12%. When the
 target is not in view, s640 still reports a "dark box" in 76% of frames -> wrong locks, the motivation for V4.
 
 **Far objects (object-size study):** correct lock of V1 drops to 27% for 20-40 px boxes and 3% below 20 px
