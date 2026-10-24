@@ -5,3 +5,5 @@ runs/
 *.csv
 view.jpg
 __pycache__/
+*.swp
+.swp
