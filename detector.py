@@ -26,6 +26,12 @@ from PIL import Image
 from ultralytics import YOLOWorld
 
 ARTICLES = {"a", "an", "the", "some"}
+# colour check: only real hues. CLIP is reliable on these (red chairs: p(red) 0.84-0.97), not on light/dark words
+# ("a dark box": the real box got p(dark) ~0.10), so black/white/grey/dark are not checked.
+CHROMATIC = ["red", "orange", "yellow", "green", "blue", "purple", "pink", "brown"]
+# alternatives the crop is compared against: the hues plus black/white/grey, so a grey or black object puts its
+# probability there instead of spreading it over the hues (a dark box got p("blue") = 0.23 without them)
+COLOUR_SET = CHROMATIC + ["black", "white", "gray"]
 
 
 def split_prompt(prompt):
@@ -53,7 +59,7 @@ def iou(a, b):
 
 class TextDetector:
     def __init__(self, prompt, model="yolov8s-worldv2.pt", noun=None, conf=0.10, imgsz=640, attr_check=False,
-                 clip_weights="weights/clip/ViT-B-32.pt", attr_margin=0.0, max_cands=8):
+                 clip_weights="weights/clip/ViT-B-32.pt", attr_margin=0.0, max_cands=8, colour_check=False):
         self.prompt = prompt
         auto_noun, has_attr = split_prompt(prompt)
         self.noun = noun or auto_noun
@@ -61,14 +67,23 @@ class TextDetector:
         self.yolo = YOLOWorld(model)
         self.attr_check = attr_check and has_attr     # nothing to check for a bare noun
         self.yolo.set_classes([self.noun if self.attr_check else prompt])
-        if self.attr_check:
+        words = re.findall(r"[a-z]+", prompt.lower())
+        self.colour = next((w for w in words if w in CHROMATIC), None) if colour_check else None
+        if self.attr_check or self.colour:
             import clip
             path = clip_weights if os.path.exists(clip_weights) else "ViT-B/32"
             self.clip, self.pre = clip.load(path, device="cpu")
             self.clip.eval()
             with torch.no_grad():
-                t = self.clip.encode_text(clip.tokenize([prompt, f"a {self.noun}"]))
-            self.text_feat = t / t.norm(dim=-1, keepdim=True)
+                if self.attr_check:
+                    t = self.clip.encode_text(clip.tokenize([prompt, f"a {self.noun}"]))
+                    self.text_feat = t / t.norm(dim=-1, keepdim=True)
+                if self.colour:
+                    # the prompt with its colour swapped for every hue: "a blue chair", "a red chair", ...
+                    variants = [re.sub(rf"\b{self.colour}\b", c, prompt, flags=re.I) for c in COLOUR_SET]
+                    t = self.clip.encode_text(clip.tokenize(variants))
+                    self.colour_feat = t / t.norm(dim=-1, keepdim=True)
+                    self.colour_idx = COLOUR_SET.index(self.colour)
 
     def _yolo(self, crops):
         """crops: list of (image, x0, y0) -> boxes in full-frame coordinates [x1, y1, x2, y2, det_conf]."""
@@ -95,6 +110,25 @@ class TextDetector:
         x0 = int(np.clip(cx - size[0] / 2, 0, w - size[0]))
         y0 = int(np.clip(cy - size[1] / 2, 0, h - size[1]))
         return frame[y0:y0 + size[1], x0:x0 + size[0]], x0, y0
+
+    def _crop_feats(self, frame, boxes):
+        h, w = frame.shape[:2]
+        ims = []
+        for x1, y1, x2, y2, *_ in boxes:
+            px, py = 0.1 * (x2 - x1), 0.1 * (y2 - y1)
+            crop = frame[int(max(0, y1 - py)):int(min(h, y2 + py)), int(max(0, x1 - px)):int(min(w, x2 + px))]
+            ims.append(self.pre(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))))
+        with torch.no_grad():
+            f = self.clip.encode_image(torch.stack(ims))
+        return f / f.norm(dim=-1, keepdim=True)
+
+    def colour_prob(self, frame, boxes):
+        """Per box: CLIP probability that it has the prompt's colour, among the same prompt in other hues.
+        1.0 for every box when the prompt has no hue word (nothing to check)."""
+        if not self.colour or not boxes:
+            return [1.0] * len(boxes)
+        p = (100.0 * self._crop_feats(frame, boxes) @ self.colour_feat.T).softmax(dim=-1)
+        return p[:, self.colour_idx].tolist()
 
     def attr_gain(self, frame, boxes):
         """CLIP logit of the full prompt minus that of the bare noun, per box (> 0: the description fits better)."""
