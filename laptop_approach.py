@@ -59,6 +59,8 @@ v6 (robot runs 2026-10-24: drove 4 m to a red pouf, lost it up close):
     and waits; tiles only in SEARCH (tracking stays at 3-9 frames/s); --max-turn 0.06 -> 0.035.
   - run07: arrived (0.45 m), but below ~1 m the detector hardly fired and the 5-frame tracker budget ran out
     while the tracker still had the pouf -> 6 needless LOST/SEARCH. Close targets get --trk-frames-close 25.
+  - run08: the pouf was found almost only by the zoomed tiles (14 detector hits in 142 frames). Tiles again while
+    stopped after a miss, and the zoomed ROI for targets up to --roi-px 130 (was 60).
 """
 import os
 os.environ.setdefault("YOLO_OFFLINE", "true")
@@ -98,7 +100,7 @@ ap.add_argument("--attr-check", action="store_true",
 ap.add_argument("--attr-conf", type=float, default=0.05, help="noun-stage threshold with --attr-check")
 ap.add_argument("--noun", default=None, help="noun for --attr-check, default = last word of the prompt")
 ap.add_argument("--no-tiles", action="store_true", help="don't run zoomed tiles while searching")
-ap.add_argument("--roi-px", type=float, default=60.0,
+ap.add_argument("--roi-px", type=float, default=130.0,
                 help="while tracking, also run a 2x zoomed crop around the target if its box is lower than this, px")
 ap.add_argument("--assoc-px", type=float, default=200.0,
                 help="pick the box nearest the previous one if it is within this distance, px")
@@ -339,8 +341,10 @@ while not stop_requested:
 
     t0 = time.perf_counter()
     recent = last_box is not None and misses <= args.lost_frames
-    if state == "SEARCH" and not args.no_tiles:
-        mode = "tiles"           # ~0.7 s per frame: only while searching, never while tracking/driving
+    if (state == "SEARCH" or misses > 0) and not args.no_tiles:
+        # ~0.7-1.1 s per frame: while searching, and while the body is stopped waiting after a miss (some objects,
+        # like the red pouf, are found almost only with the zoom); never while driving on a fresh detection
+        mode = "tiles"
     elif recent and last_box[3] - last_box[1] < args.roi_px:
         mode = "roi"
     else:
