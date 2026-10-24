@@ -1,0 +1,11 @@
+# laptop side (python 3.12). The Pi only needs: pyzmq, opencv-python, pyserial (robot_bridge.py)
+ultralytics==8.4.185
+torch==2.14.1
+torchvision==0.29.1
+opencv-python==5.0.0.93
+numpy==2.5.4
+pillow==13.0.0
+pyzmq==27.2.0
+matplotlib==3.11.2
+git+https://github.com/ultralytics/CLIP.git   # "clip" package, also used by ultralytics for YOLO-World text
+transformers==5.20.2   # only for eval/owl.py (OWLv2 / OWL-ViT benchmark)
