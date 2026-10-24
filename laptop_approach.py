@@ -308,6 +308,9 @@ def chassis_yaw_rate_deg():
 
 
 log_f = open(args.log, "w", newline="")
+# all settings of this run next to the log (the prompt was missing from the logs of the 2026-10-24 runs)
+with open(os.path.splitext(args.log)[0] + "_args.json", "w") as f:
+    json.dump(dict(vars(args), started=time.strftime("%Y-%m-%d %H:%M:%S")), f, indent=1)
 log = csv.writer(log_f)
 log.writerow(["frame_id", "t_capture", "state", "det_ms", "found", "box_ratio", "dist_m",
               "pan_cmd", "tilt_cmd", "yaw_ff_deg", "L", "R", "moving", "det_mode", "n_dets", "src", "conf", "colour_p"])
