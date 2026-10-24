@@ -71,12 +71,10 @@ With our lens (fx ~ 273 px) a 0.4 m object is ~22 px tall at 5 m and ~11 px at 1
 
 | config | ms/frame | box 80+ px | box 40-80 px | box 20-40 px | box < 20 px |
 |---|---|---|---|---|---|
-| full (= V1) | 120 | 69% (n=39) | 67% (n=118) | 25% (n=212) | 3% (n=115) |
-| + tiles (SEARCH) | 747 | 69% | 78% | 44% | 22% |
-| + ROI zoom (TRACK) | 280 | 77% | 74% | 59% | 43% |
-| 1280 input | 438 | 64% | 44% | 36% | 23% |
-
-(first run, still includes the 5 sampled frames of `S1_seq01`; timings with other jobs running)
+| full (= V1) | 112 | 69% (n=36) | 68% (n=113) | 27% (n=202) | 3% (n=113) |
+| + tiles (SEARCH) | 748 | 67% | 79% | 44% | 22% |
+| + ROI zoom (TRACK) | 295 | 78% | 75% | 60% | 44% |
+| 1280 input | 456 | 64% | 46% | 36% | 24% |
 
 - Below ~40 px the plain full-frame detector (V1) mostly fails -- this is the "can't find it beyond ~5 m" problem.
 - Zoomed tiles (used in SEARCH, ~7x the time) and a zoomed crop around the last box (used in TRACK for small

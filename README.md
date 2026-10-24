@@ -55,9 +55,9 @@ centring error 13.3 deg mean / 46 deg p95; only 33% of frames near the centre in
 m / l / x: 265 / 551 / 806 ms and 74 / 50 / 57% at the same threshold; 1280 input: 425 ms, 59%. When the
 target is not in view, s640 still reports a "dark box" in 76% of frames -> wrong locks, the motivation for V4.
 
-**Far objects (object-size study):** correct lock of V1 drops to 25% for 20-40 px boxes and 3% below 20 px
-(~5 m and ~10 m for a 0.4 m object). Zoomed tiles in SEARCH and a zoomed crop around the target in TRACK raise
-this a lot (see `eval/README.md`), at 2.5-7x the time per frame.
+**Far objects (object-size study):** correct lock of V1 drops to 27% for 20-40 px boxes and 3% below 20 px
+(~5 m and ~10 m for a 0.4 m object). Zoomed tiles in SEARCH: 44% / 22%; zoomed crop around the target in TRACK:
+60% / 44%; at ~7x / ~2.5x the time per frame (`eval/README.md`).
 
 **Approach mode fixes (2026-10-24, need robot runs):** the camera jumps (one missed detection swung the gimbal
 55 deg, 14 jumps > 20 deg in a 40 s log) came from using frames taken while the gimbal was still moving; fixed.
