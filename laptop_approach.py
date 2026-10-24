@@ -50,6 +50,13 @@ v5 (robot test 2026-10-24: "finds it but keeps rotating"):
     (--miss-frames, --lost-frames), and after a miss the next frame uses zoomed tiles again.
   - slower, stop-and-look search: 30 deg steps (20 deg locally) in snake order, move on only after
     --look-frames sharp frames at a position; slower chassis spin.
+
+v6 (robot runs 2026-10-24: drove 4 m to a red pouf, lost it up close):
+  - the detector found the pouf in only ~half the frames (score around 0.10). Once locked, weaker boxes
+    (--lock-conf) next to the last one count too, and a template tracker (tracker.py) bridges up to --trk-frames
+    missed frames (cyan box on screen).
+  - on a miss the body kept turning with the last command, at ~1 frame/s (tiles) -> over-turned. Now it stops
+    and waits; tiles only in SEARCH (tracking stays at 3-9 frames/s); --max-turn 0.06 -> 0.035.
 """
 import os
 os.environ.setdefault("YOLO_OFFLINE", "true")
@@ -67,12 +74,18 @@ import numpy as np
 import zmq
 
 from detector import TextDetector
+from tracker import TemplateTracker
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--robot", required=True)
 ap.add_argument("--prompt", required=True)
 ap.add_argument("--model", default="yolov8s-worldv2.pt")
 ap.add_argument("--conf", type=float, default=0.10)
+ap.add_argument("--lock-conf", type=float, default=0.05,
+                help="once locked, also accept weaker detections (down to this) next to the last box")
+ap.add_argument("--trk-frames", type=int, default=5,
+                help="max frames in a row bridged by the template tracker when the detector misses (0 = off)")
+ap.add_argument("--trk-score", type=float, default=0.6, help="min template match score (normalised correlation)")
 ap.add_argument("--attr-check", action="store_true",
                 help="experimental: detect the bare noun, keep boxes CLIP finds closer to the full prompt than to the "
                      "noun (helps 'a yellow chair' vs a red one, removes the target for 'a dark box'; see detector.py)")
@@ -104,7 +117,7 @@ ap.add_argument("--drive-sign", type=float, default=1.0)
 ap.add_argument("--turn-sign", type=float, default=1.0)
 ap.add_argument("--max-speed", type=float, default=0.12, help="m/s forward")
 ap.add_argument("--k-turn", type=float, default=0.002, help="track speed difference per degree of pan")
-ap.add_argument("--max-turn", type=float, default=0.06, help="max track speed difference for turning")
+ap.add_argument("--max-turn", type=float, default=0.035, help="max track speed difference for turning")
 ap.add_argument("--turn-deadband", type=float, default=5.0, help="don't turn the chassis if |pan| < this, deg")
 ap.add_argument("--align-deg", type=float, default=12.0, help="drive forward only when |pan| < this")
 ap.add_argument("--arrive-dist", type=float, default=0.45,
@@ -172,7 +185,8 @@ push.connect(f"tcp://{args.robot}:5556")
 
 print("[1/3] loading model...", flush=True)
 detector = TextDetector(args.prompt, model=args.model, noun=args.noun, attr_check=args.attr_check,
-                        conf=args.attr_conf if args.attr_check else args.conf)
+                        conf=args.attr_conf if args.attr_check else min(args.conf, args.lock_conf))
+tracker = TemplateTracker(min_score=args.trk_score)
 if detector.attr_check:
     print(f"detecting '{detector.noun}', CLIP checks the crops against '{args.prompt}'", flush=True)
 print("[2/3] model ready, waiting for frames from", args.robot, flush=True)
@@ -262,16 +276,16 @@ def chassis_yaw_rate_deg():
 log_f = open(args.log, "w", newline="")
 log = csv.writer(log_f)
 log.writerow(["frame_id", "t_capture", "state", "det_ms", "found", "box_ratio", "dist_m",
-              "pan_cmd", "tilt_cmd", "yaw_ff_deg", "L", "R", "moving", "det_mode", "n_dets"])
+              "pan_cmd", "tilt_cmd", "yaw_ff_deg", "L", "R", "moving", "det_mode", "n_dets", "src"])
 
 state = "SEARCH"
 last_seen = 0.0
 last_pan_seen = 0.0          # bearing of the target relative to the body, from settled frames only
 last_box = None              # previous target box (image coords), for association and the zoomed crop
-last_LR = (0.0, 0.0)         # last drive command, repeated during a short detection gap
 bearing_t = 0.0              # when last_pan_seen was last measured on a settled frame
 target_dist = None           # ground distance to the target's base, m (settled frames only), None = unknown
 misses = 0                   # consecutive frames without the target
+since_det = 0                # frames since the detector itself last found the target
 area_pan = None              # where (body-relative pan) the target was last seen, coarse; searched first
 prev_state = state
 search_list = []             # current search plan (pan angles); empty = make a new one
@@ -319,13 +333,27 @@ while not stop_requested:
 
     t0 = time.perf_counter()
     recent = last_box is not None and misses <= args.lost_frames
-    if (state == "SEARCH" or misses > 0) and not args.no_tiles:
-        mode = "tiles"           # searching, or just missed it: zoomed tiles so a small target isn't dropped
+    if state == "SEARCH" and not args.no_tiles:
+        mode = "tiles"           # ~0.7 s per frame: only while searching, never while tracking/driving
     elif recent and last_box[3] - last_box[1] < args.roi_px:
         mode = "roi"
     else:
         mode = "full"
     dets = detector(frame, mode=mode, last_box=last_box if recent else None)
+    if not args.attr_check:
+        # normal threshold, plus weaker boxes next to the last one once locked (the score flickers around 0.10)
+        def near_last(d):
+            return recent and math.hypot((d[0] + d[2] - last_box[0] - last_box[2]) / 2,
+                                         (d[1] + d[3] - last_box[1] - last_box[3]) / 2) < args.assoc_px
+        dets = [d for d in dets if d[5] >= args.conf or near_last(d)]
+    src = "det" if dets else ""
+    if not dets and recent and since_det < args.trk_frames:
+        box, score = tracker.update(frame)     # detector missed: look for the last detected patch nearby
+        if box is not None:
+            dets, src = [box + [score, score, 0.0]], "trk"
+    since_det = 0 if src == "det" else since_det + 1     # the tracker never extends its own budget
+    if not recent:
+        tracker.reset()
     det_ms = (time.perf_counter() - t0) * 1000.0
     now = time.time()
     dt = now - t_prev
@@ -359,9 +387,11 @@ while not stop_requested:
                 best = near
         x1, y1, x2, y2 = best[:4]
         last_box = best[:4]
+        if src == "det":
+            tracker.init(frame, best[:4])      # refreshed by real detections only (no drift onto background)
         u, v = (x1 + x2) / 2, (y1 + y2) / 2
         box_ratio = (y2 - y1) / h
-        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0) if src == "det" else (255, 200, 0), 2)
 
         err_pan, err_tilt = pixel_to_angles(u, v, fx, fy, cx, cy)
 
@@ -416,9 +446,9 @@ while not stop_requested:
                 L, R = send_drive(fwd, turn)
 
     elif misses <= args.miss_frames and state in ("TRACK", "ARRIVED"):
-        # one or two missed detections (blur, small target): keep doing what we did, no gimbal jump
-        L, R = (0.0, 0.0) if (paused or args.no_drive) else last_LR
-        push.send_json({"type": "drive", "L": L, "R": R})
+        # a few missed frames: wait for the target with the body STOPPED and the camera held. (Repeating the last
+        # command meant turning blind for up to ~3 s at 1 frame/s -> over-turned and lost the target up close.)
+        L, R = send_drive(0.0, 0.0)
         if yaw_ff != 0.0:
             send_gimbal(hdr, gimbal_pan - yaw_ff, gimbal_tilt, limit_step=False, correction=False)
 
@@ -470,9 +500,8 @@ while not stop_requested:
                     look_count += 1      # this frame was sharp and already taken at this position
             L, R = send_drive(0.0, 0.0)
 
-    last_LR = (L, R)
     log.writerow([hdr["frame_id"], f"{hdr['t_capture']:.6f}", state, f"{det_ms:.1f}", int(found),
-                  box_ratio, None if target_dist is None else f"{target_dist:.2f}", f"{gimbal_pan:.2f}", f"{gimbal_tilt:.2f}", f"{yaw_ff:.2f}", f"{L:.3f}", f"{R:.3f}", int(moving), mode, len(dets)])
+                  box_ratio, None if target_dist is None else f"{target_dist:.2f}", f"{gimbal_pan:.2f}", f"{gimbal_tilt:.2f}", f"{yaw_ff:.2f}", f"{L:.3f}", f"{R:.3f}", int(moving), mode, len(dets), src])
 
     cv2.drawMarker(frame, (int(cx), int(cy)), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
     color = {"SEARCH": (0, 200, 255), "TRACK": (0, 255, 0), "LOST": (0, 0, 255), "ARRIVED": (255, 0, 255),

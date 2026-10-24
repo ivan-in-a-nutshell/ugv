@@ -76,7 +76,8 @@ Details, method and limits: `eval/README.md`.
 | `record.py`, `run_seq.sh` | laptop | record every frame (+ V1 tracking) for the S1-S6 sequences |
 | `laptop_approach.py` | laptop | search + gimbal + chassis approach (`--headless --duration` for tests) |
 | `detector.py` | laptop | YOLO-World text detector + zoom tiles / ROI for far objects, optional CLIP attribute check |
-| `replay_bridge.py` | laptop | fake bridge that streams a recording, to test the laptop scripts without the robot |
+| `tracker.py` | laptop | template tracker that bridges a few detector misses (first step toward V2) |
+| `replay_bridge.py` | laptop | fake bridge streaming a recording; `--sim` = crude gimbal simulation for search/track tests |
 | `calibrate.py` | laptop | checkerboard calibration -> `calib.npz` (fx ~ 273 px, HFOV ~ 100 deg) |
 | `eval/` | laptop | ground truth, detector benchmark, metrics (`eval/README.md`) |
 
