@@ -57,6 +57,8 @@ v6 (robot runs 2026-10-24: drove 4 m to a red pouf, lost it up close):
     missed frames (cyan box on screen).
   - on a miss the body kept turning with the last command, at ~1 frame/s (tiles) -> over-turned. Now it stops
     and waits; tiles only in SEARCH (tracking stays at 3-9 frames/s); --max-turn 0.06 -> 0.035.
+  - run07: arrived (0.45 m), but below ~1 m the detector hardly fired and the 5-frame tracker budget ran out
+    while the tracker still had the pouf -> 6 needless LOST/SEARCH. Close targets get --trk-frames-close 25.
 """
 import os
 os.environ.setdefault("YOLO_OFFLINE", "true")
@@ -86,6 +88,10 @@ ap.add_argument("--lock-conf", type=float, default=0.05,
 ap.add_argument("--trk-frames", type=int, default=5,
                 help="max frames in a row bridged by the template tracker when the detector misses (0 = off)")
 ap.add_argument("--trk-score", type=float, default=0.6, help="min template match score (normalised correlation)")
+ap.add_argument("--trk-frames-close", type=int, default=25,
+                help="tracker budget when the target is close (box >= --close-ratio of the image height): up close "
+                     "the detector often stops recognising the object, while the tracker can hardly drift")
+ap.add_argument("--close-ratio", type=float, default=0.18)
 ap.add_argument("--attr-check", action="store_true",
                 help="experimental: detect the bare noun, keep boxes CLIP finds closer to the full prompt than to the "
                      "noun (helps 'a yellow chair' vs a red one, removes the target for 'a dark box'; see detector.py)")
@@ -347,7 +353,8 @@ while not stop_requested:
                                          (d[1] + d[3] - last_box[1] - last_box[3]) / 2) < args.assoc_px
         dets = [d for d in dets if d[5] >= args.conf or near_last(d)]
     src = "det" if dets else ""
-    if not dets and recent and since_det < args.trk_frames:
+    close = recent and (last_box[3] - last_box[1]) >= args.close_ratio * frame.shape[0]
+    if not dets and recent and since_det < (args.trk_frames_close if close else args.trk_frames):
         box, score = tracker.update(frame)     # detector missed: look for the last detected patch nearby
         if box is not None:
             dets, src = [box + [score, score, 0.0]], "trk"
