@@ -40,6 +40,16 @@ v4 (midterm fixes):
     --arrive-dist, slow down over --slow-dist. The box-height rule stays as a safety stop (--arrive-ratio 0.85).
   - detection via detector.py: zoomed 2x2 tiles while searching and a zoomed crop around a small target while
     tracking (far objects); optional CLIP attribute check (--attr-check, experimental).
+
+v5 (robot test 2026-10-24: "finds it but keeps rotating"):
+  - a target found in a frame taken mid-sweep did not update the remembered direction, so the local search
+    restarted at the old angle and swept away from it again. Now the area where it was seen is remembered
+    (area_pan; the sweep's destination if the frame was mid-move) and searched first, --local-rounds times, and
+    again after every full sweep.
+  - timeouts in seconds were shorter than one tiles frame (0.7 s): one miss = LOST. Now counted in frames
+    (--miss-frames, --lost-frames), and after a miss the next frame uses zoomed tiles again.
+  - slower, stop-and-look search: 30 deg steps (20 deg locally) in snake order, move on only after
+    --look-frames sharp frames at a position; slower chassis spin.
 """
 import os
 os.environ.setdefault("YOLO_OFFLINE", "true")
@@ -109,14 +119,22 @@ ap.add_argument("--track-width", type=float, default=0.20, help="m, distance bet
 ap.add_argument("--yaw-comp", type=float, default=1.0,
                 help="gain of gimbal counter-rotation (0 = off; increase if target still drifts out while turning)")
 # search
-ap.add_argument("--miss-grace", type=float, default=0.35,
-                help="s; a detection gap shorter than this is ignored (no LOST, gimbal and tracks keep going)")
-ap.add_argument("--lost-timeout", type=float, default=1.0)
-ap.add_argument("--local-offsets", default="0,-25,25,-50,50", help="deg around last seen pan for local search")
-ap.add_argument("--sweep", default="-90,-45,0,45,90")
-ap.add_argument("--sweep-dwell", type=float, default=1.5)
-ap.add_argument("--spin-time", type=float, default=1.5)
-ap.add_argument("--spin-speed", type=float, default=0.08)
+# losing / searching -- counted in detector frames, not seconds: one frame takes 0.1 s (full) to 0.7 s (tiles)
+ap.add_argument("--miss-frames", type=int, default=3,
+                help="up to this many frames without the target are ignored (gimbal and tracks keep going)")
+ap.add_argument("--lost-frames", type=int, default=6,
+                help="after that, hold still (LOST) until this many missed frames, then search")
+ap.add_argument("--bearing-age", type=float, default=2.5,
+                help="s; drive only on a bearing measured on a settled frame at most this old")
+ap.add_argument("--local-offsets", default="0,-20,20,-40,40",
+                help="deg around the area where the target was last seen; searched first")
+ap.add_argument("--local-rounds", type=int, default=2, help="repeat the local search this often before a full sweep")
+ap.add_argument("--sweep", default="-90,-60,-30,0,30,60,90", help="full sweep, deg (run in snake order)")
+ap.add_argument("--look-frames", type=int, default=2,
+                help="at each search position, wait for this many sharp (settled) detector frames")
+ap.add_argument("--sweep-dwell", type=float, default=4.0, help="s; max time at one search position")
+ap.add_argument("--spin-time", type=float, default=1.2)
+ap.add_argument("--spin-speed", type=float, default=0.05)
 ap.add_argument("--no-drive", action="store_true")
 ap.add_argument("--log", default="approach_log.csv")
 ap.add_argument("--headless", action="store_true", help="no video window (SSH / tests); stop with Ctrl+C")
@@ -253,9 +271,14 @@ last_box = None              # previous target box (image coords), for associati
 last_LR = (0.0, 0.0)         # last drive command, repeated during a short detection gap
 bearing_t = 0.0              # when last_pan_seen was last measured on a settled frame
 target_dist = None           # ground distance to the target's base, m (settled frames only), None = unknown
-search_list = list(GLOBAL_SWEEP)
-search_is_local = False
+misses = 0                   # consecutive frames without the target
+area_pan = None              # where (body-relative pan) the target was last seen, coarse; searched first
+prev_state = state
+search_list = []             # current search plan (pan angles); empty = make a new one
+search_phase = "global"      # "local" (around area_pan) or "global" (full sweep)
+local_round = 0
 search_idx = 0
+look_count = 0               # settled frames looked at in the current search position
 search_t0 = time.time()
 spin_until = 0.0
 first_frame = True
@@ -295,9 +318,9 @@ while not stop_requested:
         fx, fy, cx, cy = calib
 
     t0 = time.perf_counter()
-    recent = last_box is not None and time.time() - last_seen < args.lost_timeout
-    if state == "SEARCH" and not args.no_tiles:
-        mode = "tiles"
+    recent = last_box is not None and misses <= args.lost_frames
+    if (state == "SEARCH" or misses > 0) and not args.no_tiles:
+        mode = "tiles"           # searching, or just missed it: zoomed tiles so a small target isn't dropped
     elif recent and last_box[3] - last_box[1] < args.roi_px:
         mode = "roi"
     else:
@@ -311,8 +334,12 @@ while not stop_requested:
     # ---- yaw feed-forward: how much did the body rotate since the last update? ----
     yaw_ff = args.yaw_comp * chassis_yaw_rate_deg() * dt
     last_pan_seen -= yaw_ff      # the target's bearing relative to the body shrinks as we turn toward it
+    if area_pan is not None:
+        area_pan -= yaw_ff
 
     found = len(dets) > 0
+    misses = 0 if found else misses + 1
+    prev_state = state
     box_ratio = None
     L = R = 0.0
 
@@ -344,9 +371,15 @@ while not stop_requested:
         if not moving:
             # only a settled frame shows the view at hdr["pan_cmd"]; in-flight frames would count the error twice
             last_pan_seen = target_pan
+            area_pan = target_pan
             bearing_t = now
             # the tilt in the header is the real one only on settled frames, same as the pan
             target_dist = ground_dist((x1 + x2) / 2, y2, hdr["tilt_cmd"], h, fx, fy, cx, cy)
+
+        elif prev_state == "SEARCH":
+            # found in a frame taken while the camera swept: the exact angle is unknown, but the camera is on its way
+            # to gimbal_pan -- remember that area and stop the sweep there (no correction until a settled frame)
+            area_pan = gimbal_pan
 
         pan_new = gimbal_pan - yaw_ff
         tilt_new = gimbal_tilt
@@ -367,7 +400,7 @@ while not stop_requested:
         else:
             state = "TRACK"
             bearing = last_pan_seen
-            if now - bearing_t > args.lost_timeout:
+            if now - bearing_t > args.bearing_age:
                 # just locked from a frame taken while the gimbal moved: no trustworthy bearing yet, don't drive
                 L, R = send_drive(0.0, 0.0)
             else:
@@ -381,16 +414,15 @@ while not stop_requested:
                 else:
                     fwd = 0.0
                 L, R = send_drive(fwd, turn)
-        search_is_local = False
 
-    elif now - last_seen < args.miss_grace and state in ("TRACK", "ARRIVED"):
+    elif misses <= args.miss_frames and state in ("TRACK", "ARRIVED"):
         # one or two missed detections (blur, small target): keep doing what we did, no gimbal jump
         L, R = (0.0, 0.0) if (paused or args.no_drive) else last_LR
         push.send_json({"type": "drive", "L": L, "R": R})
         if yaw_ff != 0.0:
             send_gimbal(hdr, gimbal_pan - yaw_ff, gimbal_tilt, limit_step=False, correction=False)
 
-    elif now - last_seen < args.lost_timeout:
+    elif misses <= args.lost_frames and state in ("TRACK", "ARRIVED", "LOST"):
         # lost: stop the body and hold the camera where it is (it already points at the last settled bearing
         # or is moving there); sending it to a bearing from an in-flight frame is what made it jump before
         state = "LOST"
@@ -399,28 +431,43 @@ while not stop_requested:
     else:
         state = "SEARCH"
         target_dist = None
-        if not search_is_local and last_seen > 0 and now - last_seen < args.lost_timeout + 0.5:
-            # start a local search around the last known bearing
-            search_list = [clamp(last_pan_seen + o, -180.0, 180.0) for o in LOCAL_OFFSETS]
-            search_is_local = True
-            search_idx = 0
-            search_t0 = now
+        if prev_state != "SEARCH":
+            # (re)start: around the area where the target was seen, if we have seen it at all
+            search_list, local_round = [], 0
+            search_phase = "local" if area_pan is not None else "global"
 
         if now < spin_until:
             send_gimbal(hdr, 0.0, 0.0)
             L, R = send_drive(0.0, args.spin_speed)
         else:
-            if now - search_t0 > args.sweep_dwell:
-                search_idx += 1
-                search_t0 = now
+            if search_list and (look_count >= args.look_frames or now - search_t0 > args.sweep_dwell):
+                search_idx += 1          # looked long enough here -> next position
+                look_count, search_t0 = 0, now
                 if search_idx >= len(search_list):
-                    search_idx = 0
-                    if search_is_local:
-                        search_list = list(GLOBAL_SWEEP)   # local search failed -> full sweep
-                        last_seen = 0.0
+                    search_list = []
+                    if search_phase == "local" and local_round + 1 < args.local_rounds:
+                        local_round += 1
+                    elif search_phase == "local":
+                        search_phase = "global"
                     else:
-                        spin_until = now + args.spin_time   # full sweep failed -> rotate body
-            send_gimbal(hdr, search_list[search_idx], 0.0, limit_step=False)
+                        # full sweep failed: turn the body a bit (if driving is allowed), then look around the
+                        # remembered area again (it moves with the body via yaw feed-forward) or sweep again
+                        if not args.no_drive:
+                            spin_until = now + args.spin_time
+                        search_phase, local_round = ("local", 0) if area_pan is not None else ("global", 0)
+            if not search_list:
+                if search_phase == "local":
+                    search_list = [clamp(area_pan + o, -180.0, 180.0) for o in LOCAL_OFFSETS]
+                else:
+                    # snake order: start from the end nearer to where the camera points (no 180 deg jump back)
+                    search_list = list(GLOBAL_SWEEP)
+                    if abs(gimbal_pan - search_list[-1]) < abs(gimbal_pan - search_list[0]):
+                        search_list.reverse()
+                search_idx, look_count, search_t0 = 0, 0, now
+            if now >= spin_until:
+                send_gimbal(hdr, search_list[search_idx], 0.0, limit_step=False)
+                if not moving and pending is None:
+                    look_count += 1      # this frame was sharp and already taken at this position
             L, R = send_drive(0.0, 0.0)
 
     last_LR = (L, R)

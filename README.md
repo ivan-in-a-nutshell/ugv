@@ -24,12 +24,13 @@ flowchart LR
   CTRL -- ZeroMQ tcp 5556<br/>pan/tilt, L/R --> BR
 ```
 
-State machine in `laptop_approach.py`: `SEARCH` (gimbal sweep, zoomed tiles, then chassis spin) -> `TRACK`
+State machine in `laptop_approach.py`: `SEARCH` (stop-and-look gimbal sweep with zoomed tiles: first around the
+area where the target was last seen, then a full sweep, then a short chassis spin) -> `TRACK`
 (gimbal centres the target, chassis turns toward the bearing and drives) -> `ARRIVED`: the distance to the
 object's base on the floor, from camera height + gimbal tilt + calibrated angle of the box bottom
 (d = cam_height / tan(angle below horizon)), is <= `--arrive-dist` (0.45 m); slows down over the last
-`--slow-dist`. Safety stop: box height / image height >= `--arrive-ratio` (0.85). Short detection gaps are ignored (`--miss-grace`), longer ones go to `LOST`
-(hold), then a local search around the last bearing, then the full sweep.
+`--slow-dist`. Safety stop: box height / image height >= `--arrive-ratio` (0.85). Up to `--miss-frames` missed frames are ignored, up to `--lost-frames` the robot holds still (`LOST`),
+then it searches again, starting where the target was last seen.
 
 ## Variants (study design from the proposal)
 

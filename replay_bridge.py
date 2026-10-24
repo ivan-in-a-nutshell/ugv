@@ -4,6 +4,13 @@ format (json header + b"\\n" + jpeg on tcp 5555) and accepts commands on tcp 555
 back in the header (pan_cmd / tilt_cmd) like the real bridge, drive commands are only counted.
 The image does NOT react to the commands, so this tests that the laptop scripts run end to end, not control.
 
+--sim: a crude gimbal simulation for testing SEARCH / TRACK logic. One frame of the sequence is placed in a world
+at --world-pan deg; the camera view is that frame shifted by (pan - world_pan) * fx (grey outside it). The servo
+turns toward the command at --servo-dps; the header echoes the command at once, like the real bridge.
+--hide A:B blanks the world between A and B s (target gone) to test re-search.
+
+  python replay_bridge.py --seq rec/S1_seq04 --sim --world-pan 50 --hide 15:25
+
   python replay_bridge.py --seq rec/S1_seq04 --loop
   python laptop_approach.py --robot 127.0.0.1 --prompt "a yellow chair" --no-drive --headless --duration 20
 """
@@ -20,6 +27,11 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--seq", required=True)
 ap.add_argument("--fps", type=float, default=15.0)
 ap.add_argument("--loop", action="store_true")
+ap.add_argument("--sim", action="store_true")
+ap.add_argument("--still", type=int, default=0, help="--sim: index of the frame used as the world")
+ap.add_argument("--world-pan", type=float, default=50.0)
+ap.add_argument("--servo-dps", type=float, default=150.0)
+ap.add_argument("--hide", default=None, help="--sim: A:B seconds without the target")
 args = ap.parse_args()
 
 frames = sorted(glob.glob(os.path.join(args.seq, "frames", "*.jpg")))
@@ -44,6 +56,36 @@ def receiver():
 
 
 threading.Thread(target=receiver, daemon=True).start()
+
+if args.sim:
+    import cv2
+    import numpy as np
+    world = cv2.imread(frames[args.still])
+    px_per_deg = 273.0 * np.pi / 180.0          # fx of our camera, pinhole near the centre
+    hide = [float(x) for x in args.hide.split(":")] if args.hide else None
+    pan_real, t_prev, t0, frame_id = 0.0, time.monotonic(), time.monotonic(), 0
+    print(f"sim: world at {args.world_pan} deg, servo {args.servo_dps} deg/s")
+    while True:
+        t = time.monotonic()
+        step = args.servo_dps * (t - t_prev)
+        pan_real += max(-step, min(step, state["pan_cmd"] - pan_real))
+        t_prev = t
+        view = np.full_like(world, 128)
+        shift = int(round((pan_real - args.world_pan) * px_per_deg))   # camera turns right -> scene moves left
+        w = world.shape[1]
+        if not (hide and hide[0] <= t - t0 < hide[1]) and abs(shift) < w:
+            if shift >= 0:
+                view[:, :w - shift] = world[:, shift:]
+            else:
+                view[:, -shift:] = world[:, :w + shift]
+        ok, jpg = cv2.imencode(".jpg", view)
+        hdr = {"frame_id": frame_id, "t_capture": t, "pan_cmd": state["pan_cmd"], "tilt_cmd": state["tilt_cmd"],
+               "pan_fb": None, "tilt_fb": None}
+        pub.send(json.dumps(hdr).encode() + b"\n" + jpg.tobytes())
+        frame_id += 1
+        if frame_id % 30 == 0:
+            print(f"t {t - t0:5.1f}  cmd {state['pan_cmd']:7.1f}  real {pan_real:7.1f}", flush=True)
+        time.sleep(max(0.0, 1.0 / args.fps - (time.monotonic() - t)))
 print(f"replaying {len(frames)} frames from {args.seq}")
 frame_id = 0
 while True:
