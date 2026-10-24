@@ -68,6 +68,10 @@ v7 (run10: asked for "a blue chair", locked onto the red pouf): strict first loc
     while the robot stands still (state CONFIRM, orange box).
   - once locked: as before (--lock-conf next to the target, tracker), and boxes elsewhere are ignored -- it can
     no longer jump to another object while tracking; a new object only through the strict first lock.
+  - run11: correct blue chair, then a box 5x smaller next to it counted as 'near' (centre within 200 px) and the
+    lock moved to a white box, then the pouf. 'Same object' now needs overlap, or closeness relative to the box
+    size plus similar size (weak detections must overlap); and the colour is re-checked every --recheck-every
+    frames while tracking, dropping the lock after --recheck-fails failures.
 """
 import os
 os.environ.setdefault("YOLO_OFFLINE", "true")
@@ -84,7 +88,7 @@ import cv2
 import numpy as np
 import zmq
 
-from detector import TextDetector
+from detector import TextDetector, iou
 from tracker import TemplateTracker
 
 ap = argparse.ArgumentParser()
@@ -102,6 +106,10 @@ ap.add_argument("--no-colour-check", action="store_true")
 ap.add_argument("--confirm-frames", type=int, default=3,
                 help="first lock: the candidate must pass in this many frames (robot standing still) ...")
 ap.add_argument("--confirm-window", type=int, default=6, help="... out of this many, else it is rejected")
+ap.add_argument("--recheck-every", type=int, default=5,
+                help="while tracking a prompt with a hue word, re-check the colour every N frames (0 = off) ...")
+ap.add_argument("--recheck-min", type=float, default=0.08, help="... min colour probability (lower than the first lock)")
+ap.add_argument("--recheck-fails", type=int, default=3, help="... drop the lock after this many failed checks in a row")
 ap.add_argument("--trk-frames", type=int, default=5,
                 help="max frames in a row bridged by the template tracker when the detector misses (0 = off)")
 ap.add_argument("--trk-score", type=float, default=0.6, help="min template match score (normalised correlation)")
@@ -314,6 +322,9 @@ misses = 0                   # consecutive frames without the target
 since_det = 0                # frames since the detector itself last found the target
 confirm_box = None           # candidate being confirmed before the first lock
 confirm_pass = confirm_n = 0 # frames it passed / frames spent confirming
+recheck_n = recheck_fail = 0 # colour re-check while tracking
+last_box_angles = (0.0, 0.0) # gimbal pan/tilt the frame of last_box was labelled with
+PX_PER_DEG = None            # image shift per degree of gimbal motion near the centre (fx * pi / 180)
 area_pan = None              # where (body-relative pan) the target was last seen, coarse; searched first
 prev_state = state
 search_list = []             # current search plan (pan angles); empty = make a new one
@@ -361,6 +372,15 @@ while not stop_requested:
 
     t0 = time.perf_counter()
     recent = last_box is not None and misses <= args.lost_frames
+    if PX_PER_DEG is None:
+        PX_PER_DEG = fx * math.pi / 180.0
+    # where the target should be now: the last box moved by the gimbal motion since then (a 35 deg centring move
+    # shifts it ~170 px, more than the same-object test allows)
+    pred_box, shift = last_box, (0.0, 0.0)
+    if recent:
+        shift = (-args.pan_sign * (hdr["pan_cmd"] - last_box_angles[0]) * PX_PER_DEG,
+                 args.tilt_sign * (hdr["tilt_cmd"] - last_box_angles[1]) * PX_PER_DEG)
+        pred_box = [last_box[0] + shift[0], last_box[1] + shift[1], last_box[2] + shift[0], last_box[3] + shift[1]]
     if (state in ("SEARCH", "CONFIRM") or misses > 0) and not args.no_tiles:
         # ~0.7-1.1 s per frame: while searching, and while the body is stopped waiting after a miss (some objects,
         # like the red pouf, are found almost only with the zoom); never while driving on a fresh detection
@@ -369,16 +389,31 @@ while not stop_requested:
         mode = "roi"
     else:
         mode = "full"
-    dets = detector(frame, mode=mode, last_box=last_box if recent else None)
+    dets = detector(frame, mode=mode, last_box=pred_box if recent else None)
     def near(d, ref):
         return math.hypot((d[0] + d[2] - ref[0] - ref[2]) / 2, (d[1] + d[3] - ref[1] - ref[3]) / 2) < args.assoc_px
+
+    def same_object(d, ref):
+        """Overlaps the last box, or is close relative to its size AND of similar size. (run11: a box 5x smaller
+        than the chair, 150 px away, was taken as 'near' -> the lock moved to a white box, then to the pouf.)
+        Weak detections (score below --conf) must overlap."""
+        o = iou(d, ref)
+        if o >= 0.3:
+            return True
+        if d[5] < args.conf:
+            return False
+        rw, rh = ref[2] - ref[0], ref[3] - ref[1]
+        hr = (d[3] - d[1]) / max(rh, 1.0)
+        dist = math.hypot((d[0] + d[2] - ref[0] - ref[2]) / 2, (d[1] + d[3] - ref[1] - ref[3]) / 2)
+        return 0.6 <= hr <= 1.7 and dist < 0.75 * max(rw, rh) + 60
 
     locked = recent and state in ("TRACK", "ARRIVED", "LOST")
     colour_p = None
     if locked:
         # relaxed once locked: any box next to the target counts, down to --lock-conf (the score flickers); boxes
         # elsewhere are ignored, so it never switches to another object while tracking (run10: jumped to the pouf)
-        dets = [d for d in dets if near(d, last_box)]
+        dets = [d for d in dets if same_object(d, pred_box) or same_object(d, last_box)]
+        dets.sort(key=lambda d: -max(iou(d, pred_box), iou(d, last_box)))
     else:
         # strict first lock / re-acquisition: higher score, next to the candidate being confirmed, right colour
         dets = [d for d in dets if d[5] >= args.acquire_conf and (state != "CONFIRM" or near(d, confirm_box))]
@@ -389,10 +424,23 @@ while not stop_requested:
     src = "det" if dets else ""
     close = recent and (last_box[3] - last_box[1]) >= args.close_ratio * frame.shape[0]
     if not dets and locked and since_det < (args.trk_frames_close if close else args.trk_frames):
-        box, score = tracker.update(frame)     # detector missed: look for the last detected patch nearby
+        box, score = tracker.update(frame, around=pred_box)   # detector missed: last patch, where it should be
         if box is not None:
             dets, src = [box + [score, score, 0.0]], "trk"
     since_det = 0 if src == "det" else since_det + 1     # the tracker never extends its own budget
+    lock_dropped = False
+    if locked and src == "det" and detector.colour and args.recheck_every:
+        # identity safety net: is the tracked object still the asked colour? (V4 will add a visual template)
+        recheck_n += 1
+        if recheck_n % args.recheck_every == 0:
+            colour_p = detector.colour_prob(frame, dets[:1])[0]
+            recheck_fail = recheck_fail + 1 if colour_p < args.recheck_min else 0
+            if recheck_fail >= args.recheck_fails:
+                print(f"colour re-check failed {recheck_fail}x (p={colour_p:.2f}) -> dropping the lock", flush=True)
+                dets, src, lock_dropped = [], "", True
+                recheck_fail = 0
+    if not locked:
+        recheck_n = recheck_fail = 0
     if not recent:
         tracker.reset()
     det_ms = (time.perf_counter() - t0) * 1000.0
@@ -408,6 +456,9 @@ while not stop_requested:
 
     found = len(dets) > 0
     misses = 0 if found else misses + 1
+    if lock_dropped:
+        misses = args.lost_frames + 1            # straight back to the strict search, no grace / LOST hold
+        last_box = None
     prev_state = state
     box_ratio = None
     L = R = 0.0
@@ -446,6 +497,7 @@ while not stop_requested:
                 best = near
         x1, y1, x2, y2 = best[:4]
         last_box = best[:4]
+        last_box_angles = (hdr["pan_cmd"], hdr["tilt_cmd"])
         if src == "det":
             tracker.init(frame, best[:4])      # refreshed by real detections only (no drift onto background)
         u, v = (x1 + x2) / 2, (y1 + y2) / 2

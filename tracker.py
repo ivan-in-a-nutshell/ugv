@@ -31,13 +31,14 @@ class TemplateTracker:
         self.tmpl = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
         self.box = [x1, y1, x2, y2]
 
-    def update(self, frame):
-        """-> (box [x1, y1, x2, y2], score) or (None, best score) if the patch is not found well enough."""
+    def update(self, frame, around=None):
+        """-> (box [x1, y1, x2, y2], score) or (None, best score) if the patch is not found well enough.
+        around: where to search (e.g. the last box moved by the gimbal motion since); default: the template's box."""
         if self.tmpl is None:
             return None, 0.0
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         H, W = gray.shape
-        x1, y1, x2, y2 = self.box
+        x1, y1, x2, y2 = [int(round(v)) for v in (around if around is not None else self.box)]
         bw, bh = x2 - x1, y2 - y1
         # search window: the last box grown by `search` box sizes (+ 40 px) on every side
         mx, my = int(self.search * bw) + 40, int(self.search * bh) + 40
