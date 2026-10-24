@@ -25,7 +25,9 @@ flowchart LR
 ```
 
 State machine in `laptop_approach.py`: `SEARCH` (stop-and-look gimbal sweep with zoomed tiles: first around the
-area where the target was last seen, then a full sweep, then a short chassis spin) -> `TRACK`
+area where the target was last seen, then a full sweep, then a short chassis spin) -> `CONFIRM` (strict first lock:
+higher score, CLIP check of the colour word, same object in 3 of 6 frames, standing still) -> `TRACK` (relaxed:
+weaker boxes next to the target and a template tracker count, other objects are ignored)
 (gimbal centres the target, chassis turns toward the bearing and drives) -> `ARRIVED`: the distance to the
 object's base on the floor, from camera height + gimbal tilt + calibrated angle of the box bottom
 (d = cam_height / tan(angle below horizon)), is <= `--arrive-dist` (0.45 m); slows down over the last

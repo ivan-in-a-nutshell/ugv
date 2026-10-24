@@ -61,6 +61,13 @@ v6 (robot runs 2026-10-24: drove 4 m to a red pouf, lost it up close):
     while the tracker still had the pouf -> 6 needless LOST/SEARCH. Close targets get --trk-frames-close 25.
   - run08: the pouf was found almost only by the zoomed tiles (14 detector hits in 142 frames). Tiles again while
     stopped after a miss, and the zoomed ROI for targets up to --roi-px 130 (was 60).
+
+v7 (run10: asked for "a blue chair", locked onto the red pouf): strict first lock, relaxed tracking.
+  - first lock (and re-acquisition after LOST): score >= --acquire-conf, CLIP colour check for hue words
+    (--colour-min; red/blue/yellow... only), and the same object in --confirm-frames of --confirm-window frames
+    while the robot stands still (state CONFIRM, orange box).
+  - once locked: as before (--lock-conf next to the target, tracker), and boxes elsewhere are ignored -- it can
+    no longer jump to another object while tracking; a new object only through the strict first lock.
 """
 import os
 os.environ.setdefault("YOLO_OFFLINE", "true")
@@ -87,6 +94,14 @@ ap.add_argument("--model", default="yolov8s-worldv2.pt")
 ap.add_argument("--conf", type=float, default=0.10)
 ap.add_argument("--lock-conf", type=float, default=0.05,
                 help="once locked, also accept weaker detections (down to this) next to the last box")
+# strict first lock (relaxed only once locked): run10 locked onto a red pouf when asked for "a blue chair"
+ap.add_argument("--acquire-conf", type=float, default=0.15, help="detector score needed for a first lock")
+ap.add_argument("--colour-min", type=float, default=0.15,
+                help="first lock: min CLIP probability of the prompt's colour (only for hue words: red, blue, ...)")
+ap.add_argument("--no-colour-check", action="store_true")
+ap.add_argument("--confirm-frames", type=int, default=3,
+                help="first lock: the candidate must pass in this many frames (robot standing still) ...")
+ap.add_argument("--confirm-window", type=int, default=6, help="... out of this many, else it is rejected")
 ap.add_argument("--trk-frames", type=int, default=5,
                 help="max frames in a row bridged by the template tracker when the detector misses (0 = off)")
 ap.add_argument("--trk-score", type=float, default=0.6, help="min template match score (normalised correlation)")
@@ -193,7 +208,10 @@ push.connect(f"tcp://{args.robot}:5556")
 
 print("[1/3] loading model...", flush=True)
 detector = TextDetector(args.prompt, model=args.model, noun=args.noun, attr_check=args.attr_check,
-                        conf=args.attr_conf if args.attr_check else min(args.conf, args.lock_conf))
+                        conf=args.attr_conf if args.attr_check else min(args.conf, args.lock_conf),
+                        colour_check=not args.no_colour_check)
+if detector.colour:
+    print(f"first lock checks the colour '{detector.colour}' with CLIP", flush=True)
 tracker = TemplateTracker(min_score=args.trk_score)
 if detector.attr_check:
     print(f"detecting '{detector.noun}', CLIP checks the crops against '{args.prompt}'", flush=True)
@@ -284,7 +302,7 @@ def chassis_yaw_rate_deg():
 log_f = open(args.log, "w", newline="")
 log = csv.writer(log_f)
 log.writerow(["frame_id", "t_capture", "state", "det_ms", "found", "box_ratio", "dist_m",
-              "pan_cmd", "tilt_cmd", "yaw_ff_deg", "L", "R", "moving", "det_mode", "n_dets", "src"])
+              "pan_cmd", "tilt_cmd", "yaw_ff_deg", "L", "R", "moving", "det_mode", "n_dets", "src", "conf", "colour_p"])
 
 state = "SEARCH"
 last_seen = 0.0
@@ -294,6 +312,8 @@ bearing_t = 0.0              # when last_pan_seen was last measured on a settled
 target_dist = None           # ground distance to the target's base, m (settled frames only), None = unknown
 misses = 0                   # consecutive frames without the target
 since_det = 0                # frames since the detector itself last found the target
+confirm_box = None           # candidate being confirmed before the first lock
+confirm_pass = confirm_n = 0 # frames it passed / frames spent confirming
 area_pan = None              # where (body-relative pan) the target was last seen, coarse; searched first
 prev_state = state
 search_list = []             # current search plan (pan angles); empty = make a new one
@@ -341,7 +361,7 @@ while not stop_requested:
 
     t0 = time.perf_counter()
     recent = last_box is not None and misses <= args.lost_frames
-    if (state == "SEARCH" or misses > 0) and not args.no_tiles:
+    if (state in ("SEARCH", "CONFIRM") or misses > 0) and not args.no_tiles:
         # ~0.7-1.1 s per frame: while searching, and while the body is stopped waiting after a miss (some objects,
         # like the red pouf, are found almost only with the zoom); never while driving on a fresh detection
         mode = "tiles"
@@ -350,15 +370,25 @@ while not stop_requested:
     else:
         mode = "full"
     dets = detector(frame, mode=mode, last_box=last_box if recent else None)
-    if not args.attr_check:
-        # normal threshold, plus weaker boxes next to the last one once locked (the score flickers around 0.10)
-        def near_last(d):
-            return recent and math.hypot((d[0] + d[2] - last_box[0] - last_box[2]) / 2,
-                                         (d[1] + d[3] - last_box[1] - last_box[3]) / 2) < args.assoc_px
-        dets = [d for d in dets if d[5] >= args.conf or near_last(d)]
+    def near(d, ref):
+        return math.hypot((d[0] + d[2] - ref[0] - ref[2]) / 2, (d[1] + d[3] - ref[1] - ref[3]) / 2) < args.assoc_px
+
+    locked = recent and state in ("TRACK", "ARRIVED", "LOST")
+    colour_p = None
+    if locked:
+        # relaxed once locked: any box next to the target counts, down to --lock-conf (the score flickers); boxes
+        # elsewhere are ignored, so it never switches to another object while tracking (run10: jumped to the pouf)
+        dets = [d for d in dets if near(d, last_box)]
+    else:
+        # strict first lock / re-acquisition: higher score, next to the candidate being confirmed, right colour
+        dets = [d for d in dets if d[5] >= args.acquire_conf and (state != "CONFIRM" or near(d, confirm_box))]
+        if dets and detector.colour:
+            ps = detector.colour_prob(frame, dets)
+            colour_p = max(ps)
+            dets = [d for d, p in zip(dets, ps) if p >= args.colour_min]
     src = "det" if dets else ""
     close = recent and (last_box[3] - last_box[1]) >= args.close_ratio * frame.shape[0]
-    if not dets and recent and since_det < (args.trk_frames_close if close else args.trk_frames):
+    if not dets and locked and since_det < (args.trk_frames_close if close else args.trk_frames):
         box, score = tracker.update(frame)     # detector missed: look for the last detected patch nearby
         if box is not None:
             dets, src = [box + [score, score, 0.0]], "trk"
@@ -382,9 +412,27 @@ while not stop_requested:
     box_ratio = None
     L = R = 0.0
 
+    # first lock: the candidate has to pass the strict checks in --confirm-frames of --confirm-window frames
+    if found and not locked:
+        if state != "CONFIRM":
+            confirm_pass = confirm_n = 0
+        confirm_pass += 1
+        confirm_box = dets[0][:4]
+    if state == "CONFIRM" or (found and not locked):
+        confirm_n += 1
+    confirmed = found and not locked and confirm_pass >= args.confirm_frames
+    if confirmed:
+        last_box, recent = confirm_box, True     # lock onto exactly the confirmed object
+
     if hold:
         state = "HOLD"
         L, R = send_drive(0.0, 0.0)
+
+    elif found and not locked and not confirmed:
+        state = "CONFIRM"                        # candidate: stand still and look again
+        L, R = send_drive(0.0, 0.0)
+        x1, y1, x2, y2 = confirm_box
+        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 165, 255), 2)
 
     elif found:
         last_seen = now
@@ -417,7 +465,7 @@ while not stop_requested:
             # the tilt in the header is the real one only on settled frames, same as the pan
             target_dist = ground_dist((x1 + x2) / 2, y2, hdr["tilt_cmd"], h, fx, fy, cx, cy)
 
-        elif prev_state == "SEARCH":
+        elif prev_state in ("SEARCH", "CONFIRM"):
             # found in a frame taken while the camera swept: the exact angle is unknown, but the camera is on its way
             # to gimbal_pan -- remember that area and stop the sweep there (no correction until a settled frame)
             area_pan = gimbal_pan
@@ -456,6 +504,9 @@ while not stop_requested:
                     fwd = 0.0
                 L, R = send_drive(fwd, turn)
 
+    elif state == "CONFIRM" and confirm_n < args.confirm_window:
+        L, R = send_drive(0.0, 0.0)              # candidate not seen in this frame: keep looking, standing still
+
     elif misses <= args.miss_frames and state in ("TRACK", "ARRIVED"):
         # a few missed frames: wait for the target with the body STOPPED and the camera held. (Repeating the last
         # command meant turning blind for up to ~3 s at 1 frame/s -> over-turned and lost the target up close.)
@@ -472,7 +523,7 @@ while not stop_requested:
     else:
         state = "SEARCH"
         target_dist = None
-        if prev_state != "SEARCH":
+        if prev_state not in ("SEARCH", "CONFIRM"):    # a rejected candidate: just continue the sweep
             # (re)start: around the area where the target was seen, if we have seen it at all
             search_list, local_round = [], 0
             search_phase = "local" if area_pan is not None else "global"
@@ -512,10 +563,12 @@ while not stop_requested:
             L, R = send_drive(0.0, 0.0)
 
     log.writerow([hdr["frame_id"], f"{hdr['t_capture']:.6f}", state, f"{det_ms:.1f}", int(found),
-                  box_ratio, None if target_dist is None else f"{target_dist:.2f}", f"{gimbal_pan:.2f}", f"{gimbal_tilt:.2f}", f"{yaw_ff:.2f}", f"{L:.3f}", f"{R:.3f}", int(moving), mode, len(dets), src])
+                  box_ratio, None if target_dist is None else f"{target_dist:.2f}", f"{gimbal_pan:.2f}", f"{gimbal_tilt:.2f}", f"{yaw_ff:.2f}", f"{L:.3f}", f"{R:.3f}", int(moving), mode, len(dets), src,
+                  f"{dets[0][5]:.2f}" if dets else None, None if colour_p is None else f"{colour_p:.2f}"])
 
     cv2.drawMarker(frame, (int(cx), int(cy)), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
     color = {"SEARCH": (0, 200, 255), "TRACK": (0, 255, 0), "LOST": (0, 0, 255), "ARRIVED": (255, 0, 255),
+             "CONFIRM": (0, 165, 255),
              "HOLD": (200, 200, 200)}[state]
     txt = f"{state}{' PAUSED' if paused else ''}{' moving' if moving else ''}  det {det_ms:.0f}ms  pan {gimbal_pan:.0f}  L {L:.2f} R {R:.2f}"
     if box_ratio is not None:
