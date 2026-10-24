@@ -25,8 +25,10 @@ flowchart LR
 ```
 
 State machine in `laptop_approach.py`: `SEARCH` (gimbal sweep, zoomed tiles, then chassis spin) -> `TRACK`
-(gimbal centres the target, chassis turns toward the bearing and drives) -> `ARRIVED` (box height / image
-height >= `--arrive-ratio`). Short detection gaps are ignored (`--miss-grace`), longer ones go to `LOST`
+(gimbal centres the target, chassis turns toward the bearing and drives) -> `ARRIVED`: the distance to the
+object's base on the floor, from camera height + gimbal tilt + calibrated angle of the box bottom
+(d = cam_height / tan(angle below horizon)), is <= `--arrive-dist` (0.45 m); slows down over the last
+`--slow-dist`. Safety stop: box height / image height >= `--arrive-ratio` (0.85). Short detection gaps are ignored (`--miss-grace`), longer ones go to `LOST`
 (hold), then a local search around the last bearing, then the full sweep.
 
 ## Variants (study design from the proposal)
@@ -46,7 +48,22 @@ S5 distractor of the same class, S6 low light), 2 rooms, 20 s each at 15 fps, re
 Quick ground truth: one frame every 2 s (308 frames), the target box chosen by hand among detector candidates
 (`eval/candidates.py`, `eval/make_gt.py`). Full CVAT annotation is planned.
 
-RESULTS_PLACEHOLDER
+**V1 baseline (closed loop, 298 labelled frames):** target in frame 92% overall (S4 "leaves the frame": 71%),
+centring error 13.3 deg mean / 46 deg p95; only 33% of frames near the centre in S2 (fast motion).
+
+**Detector choice (open loop, laptop CPU):** YOLO-World v2 **s** at 640 -- 102 ms/frame, correct lock 78%.
+m / l / x: 265 / 551 / 806 ms and 74 / 50 / 57% at the same threshold; 1280 input: 425 ms, 59%. When the
+target is not in view, s640 still reports a "dark box" in 76% of frames -> wrong locks, the motivation for V4.
+
+**Far objects (object-size study):** correct lock of V1 drops to 25% for 20-40 px boxes and 3% below 20 px
+(~5 m and ~10 m for a 0.4 m object). Zoomed tiles in SEARCH and a zoomed crop around the target in TRACK raise
+this a lot (see `eval/README.md`), at 2.5-7x the time per frame.
+
+**Approach mode fixes (2026-10-24, need robot runs):** the camera jumps (one missed detection swung the gimbal
+55 deg, 14 jumps > 20 deg in a 40 s log) came from using frames taken while the gimbal was still moving; fixed.
+Arrival is now by ground distance (stop ~0.45 m from the object) instead of box size (stopped ~1.2 m from a chair).
+
+Details, method and limits: `eval/README.md`.
 
 ## Repository
 

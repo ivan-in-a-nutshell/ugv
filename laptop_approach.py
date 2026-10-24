@@ -34,6 +34,10 @@ v4 (midterm fixes):
     wrong bearing at full speed (logged: -96 -> -151 deg). Now the bearing is only taken from settled frames,
     a short miss (--miss-grace) keeps everything as it is, LOST holds the gimbal, and --max-step is 35 deg.
   - with several boxes, keep the one closest to the previous box instead of the most confident one.
+  - arriving: the old rule (box height >= 40% of the image) stopped ~1.2 m from a chair and metres from a person.
+    Now the distance to the object's base on the floor is estimated from the camera height, the gimbal tilt and
+    the calibrated angle of the box's bottom edge (d = cam_height / tan(angle below horizon)); stop at
+    --arrive-dist, slow down over --slow-dist. The box-height rule stays as a safety stop (--arrive-ratio 0.85).
   - detection via detector.py: zoomed 2x2 tiles while searching and a zoomed crop around a small target while
     tracking (far objects); optional CLIP attribute check (--attr-check, experimental).
 """
@@ -93,7 +97,13 @@ ap.add_argument("--k-turn", type=float, default=0.002, help="track speed differe
 ap.add_argument("--max-turn", type=float, default=0.06, help="max track speed difference for turning")
 ap.add_argument("--turn-deadband", type=float, default=5.0, help="don't turn the chassis if |pan| < this, deg")
 ap.add_argument("--align-deg", type=float, default=12.0, help="drive forward only when |pan| < this")
-ap.add_argument("--arrive-ratio", type=float, default=0.40)
+ap.add_argument("--arrive-dist", type=float, default=0.45,
+                help="m; stop when the object's base on the floor is this close to the camera (ground-plane estimate)")
+ap.add_argument("--cam-height", type=float, default=0.25,
+                help="m; height of the camera lens above the floor -- MEASURE IT, the distance scales with it")
+ap.add_argument("--slow-dist", type=float, default=1.0, help="m; slow down over this distance before the stop point")
+ap.add_argument("--arrive-ratio", type=float, default=0.85,
+                help="safety stop: box height / image height >= this (objects not standing on the floor)")
 # yaw feed-forward
 ap.add_argument("--track-width", type=float, default=0.20, help="m, distance between track centers")
 ap.add_argument("--yaw-comp", type=float, default=1.0,
@@ -201,6 +211,17 @@ def update_settle(hdr):
     return pending is not None
 
 
+def ground_dist(u, y_bottom, tilt_cmd, h, fx, fy, cx, cy):
+    """Distance (m, along the floor) from the camera to the point where the box's bottom edge touches the floor.
+    Assumes the object stands on the floor. If the bottom edge is cut off by the image border, the true base is
+    even lower, so the value is an upper bound -- still safe for the stop decision. None near/above the horizon."""
+    _, below_axis = pixel_to_angles(u, min(y_bottom, h - 1), fx, fy, cx, cy)   # deg, + = below the optical axis
+    depression = -args.tilt_sign * tilt_cmd + below_axis                       # deg below the horizon
+    if depression < 2.0:
+        return None
+    return args.cam_height / math.tan(math.radians(depression))
+
+
 def send_drive(v, turn):
     """v = forward speed; turn > 0 rotates the robot toward positive pan (after --turn-sign is set right)."""
     global turn_now
@@ -222,7 +243,7 @@ def chassis_yaw_rate_deg():
 
 log_f = open(args.log, "w", newline="")
 log = csv.writer(log_f)
-log.writerow(["frame_id", "t_capture", "state", "det_ms", "found", "box_ratio",
+log.writerow(["frame_id", "t_capture", "state", "det_ms", "found", "box_ratio", "dist_m",
               "pan_cmd", "tilt_cmd", "yaw_ff_deg", "L", "R", "moving", "det_mode", "n_dets"])
 
 state = "SEARCH"
@@ -231,6 +252,7 @@ last_pan_seen = 0.0          # bearing of the target relative to the body, from 
 last_box = None              # previous target box (image coords), for association and the zoomed crop
 last_LR = (0.0, 0.0)         # last drive command, repeated during a short detection gap
 bearing_t = 0.0              # when last_pan_seen was last measured on a settled frame
+target_dist = None           # ground distance to the target's base, m (settled frames only), None = unknown
 search_list = list(GLOBAL_SWEEP)
 search_is_local = False
 search_idx = 0
@@ -323,6 +345,8 @@ while not stop_requested:
             # only a settled frame shows the view at hdr["pan_cmd"]; in-flight frames would count the error twice
             last_pan_seen = target_pan
             bearing_t = now
+            # the tilt in the header is the real one only on settled frames, same as the pan
+            target_dist = ground_dist((x1 + x2) / 2, y2, hdr["tilt_cmd"], h, fx, fy, cx, cy)
 
         pan_new = gimbal_pan - yaw_ff
         tilt_new = gimbal_tilt
@@ -337,7 +361,7 @@ while not stop_requested:
                 tilt_new = tilt_new + args.gain * (target_tilt - tilt_new)
             send_gimbal(hdr, pan_new, tilt_new)
 
-        if box_ratio >= args.arrive_ratio:
+        if (target_dist is not None and target_dist <= args.arrive_dist) or box_ratio >= args.arrive_ratio:
             state = "ARRIVED"
             L, R = send_drive(0.0, 0.0)
         else:
@@ -349,8 +373,11 @@ while not stop_requested:
             else:
                 turn = 0.0 if abs(bearing) < args.turn_deadband else args.k_turn * bearing
                 if abs(bearing) < args.align_deg:
-                    closeness = box_ratio / args.arrive_ratio
-                    fwd = args.max_speed * max(0.3, 1.0 - closeness)
+                    if target_dist is not None:
+                        # full speed until --slow-dist before the stop point, then down to 25%
+                        fwd = args.max_speed * clamp((target_dist - args.arrive_dist) / args.slow_dist, 0.25, 1.0)
+                    else:
+                        fwd = args.max_speed * max(0.3, 1.0 - box_ratio / args.arrive_ratio)
                 else:
                     fwd = 0.0
                 L, R = send_drive(fwd, turn)
@@ -371,6 +398,7 @@ while not stop_requested:
 
     else:
         state = "SEARCH"
+        target_dist = None
         if not search_is_local and last_seen > 0 and now - last_seen < args.lost_timeout + 0.5:
             # start a local search around the last known bearing
             search_list = [clamp(last_pan_seen + o, -180.0, 180.0) for o in LOCAL_OFFSETS]
@@ -397,7 +425,7 @@ while not stop_requested:
 
     last_LR = (L, R)
     log.writerow([hdr["frame_id"], f"{hdr['t_capture']:.6f}", state, f"{det_ms:.1f}", int(found),
-                  box_ratio, f"{gimbal_pan:.2f}", f"{gimbal_tilt:.2f}", f"{yaw_ff:.2f}", f"{L:.3f}", f"{R:.3f}", int(moving), mode, len(dets)])
+                  box_ratio, None if target_dist is None else f"{target_dist:.2f}", f"{gimbal_pan:.2f}", f"{gimbal_tilt:.2f}", f"{yaw_ff:.2f}", f"{L:.3f}", f"{R:.3f}", int(moving), mode, len(dets)])
 
     cv2.drawMarker(frame, (int(cx), int(cy)), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
     color = {"SEARCH": (0, 200, 255), "TRACK": (0, 255, 0), "LOST": (0, 0, 255), "ARRIVED": (255, 0, 255),
@@ -405,6 +433,8 @@ while not stop_requested:
     txt = f"{state}{' PAUSED' if paused else ''}{' moving' if moving else ''}  det {det_ms:.0f}ms  pan {gimbal_pan:.0f}  L {L:.2f} R {R:.2f}"
     if box_ratio is not None:
         txt += f"  box {box_ratio:.2f}/{args.arrive_ratio:.2f}"
+    if target_dist is not None:
+        txt += f"  dist {target_dist:.2f}/{args.arrive_dist:.2f} m"
     cv2.putText(frame, txt, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
     if args.headless:
         continue
