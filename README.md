@@ -7,7 +7,7 @@ hardware (~100 ms per frame on the laptop CPU, delayed by Wi-Fi), while the gimb
 signal. The project builds fast components around it and measures what each one adds (V1-V4).
 
 Team: Arsen Botsko, Ivan Zarytskyi, Zakhar Veresniuk (UCU, AI course 2026). Proposal:
-`Proposal_Veresniuk_Botsko_Zarytskyi-1.pdf`. Operational details (networks, setup, tuning): `HANDOVER.md`.
+`Proposal_Veresniuk_Botsko_Zarytskyi-1.pdf`.
 
 ## Pipeline
 

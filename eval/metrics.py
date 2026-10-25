@@ -22,7 +22,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from detector import iou
 
-NOT_IN_DATASET = {"S1_seq01"}     # old test take (HANDOVER section 6)
+NOT_IN_DATASET = {"S1_seq01"}     # old test take
 gt = {k: g for k, g in json.load(open("eval/gt.json")).items() if k.split("/")[0] not in NOT_IN_DATASET}
 calib = np.load("calib.npz")
 K, dist = calib["K"], calib["dist"]
